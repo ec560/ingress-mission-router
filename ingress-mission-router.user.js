@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.7.0
+// @version      0.8.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
@@ -115,12 +115,23 @@
       p.controller?.signal.addEventListener('abort', cancel, {once: true});
       const timer = setTimeout(cancel, 60000);
       try {
-        const response = await fetch('https://api.openrouteservice.org/v2/' + endpoint, {
+        const response = await fetch('https://api.heigit.org/openrouteservice/v2/' + endpoint, {
           method: 'POST', headers: {'Content-Type': 'application/json', Authorization: key},
           body: JSON.stringify(body), signal: controller.signal, credentials: 'omit'
         });
         if (!response.ok) {
-          const errors = {401: 'Invalid API key.', 403: 'API key rejected or quota unavailable.',
+          if (response.status === 403) {
+            let data;
+            try { data = await response.json(); } catch (e) {
+              // A missing/non-JSON error body must not hide the HTTP status.
+              if (controller.signal.aborted) throw e;
+            }
+            const detail = typeof data?.error === 'string' ? data.error : data?.error?.message || data?.message;
+            const message = typeof detail === 'string' ? detail.trim() : '';
+            throw Error('Walking service access denied (403). Check your API key and account access to this API.' +
+              (message ? ` Service message: ${message}` : ''));
+          }
+          const errors = {401: 'Invalid API key.',
             429: 'Routing quota or rate limit reached. Wait and try again.',
             400: 'Routing service rejected these portals. Try a smaller area or exclude off-path portals.',
             404: 'No walking route found for these portals.'};
@@ -449,6 +460,81 @@
       }
       return penalty;
     };
+    // Visit selected portals on first entering their 30m interaction area.
+    // Keep the actual walked trace: crossing a straight preview link is not
+    // evidence of access. Sampling stays on service edges and includes joins.
+    p.firstEncounterWalk = async (route, geometry, closed, endGuid, progress) => {
+      p.checkCancel();
+      const pending = new Map(route.slice(1).map(portal => [portal.guid, portal]));
+      const end = endGuid ? pending.get(endGuid) : null;
+      if (end) pending.delete(endGuid);
+      const first = geometry.legs[0]?.line[0];
+      if (!first || p.distance(route[0], {lat: first[0], lng: first[1]}) > 30.001)
+        throw Error('Walking path does not start within reach of the starting portal.');
+      const ordered = [route[0]], legs = [], interactions = [{lat: first[0], lng: first[1]}];
+      let line = [first], distance = 0, duration = 0, samples = 0;
+      const visit = (portal, ll) => {
+        ordered.push(portal); interactions.push({lat: ll[0], lng: ll[1]});
+        legs.push({line, distance, duration});
+        line = [ll]; distance = 0; duration = 0;
+        pending.delete(portal.guid);
+      };
+      const encounter = ll => {
+        const point = {lat: ll[0], lng: ll[1]};
+        // Preserve prior order when several portals can be visited at one spot.
+        for (const portal of pending.values()) if (p.distance(portal, point) <= 30) visit(portal, ll);
+      };
+      encounter(first);
+      trace: for (const leg of geometry.legs) {
+        const lengths = leg.line.slice(1).map((ll, i) => p.distance(
+          {lat: leg.line[i][0], lng: leg.line[i][1]}, {lat: ll[0], lng: ll[1]}));
+        const total = lengths.reduce((sum, value) => sum + value, 0);
+        for (let i = 1; i < leg.line.length; i++) {
+          if (!pending.size && !end && !closed) break trace;
+          const a = leg.line[i - 1], b = leg.line[i], steps = Math.max(1, Math.ceil(lengths[i - 1] / 5));
+          for (let step = 1; step <= steps; step++) {
+            const t = step / steps;
+            const ll = step === steps ? b : [a[0] + (b[0] - a[0]) * t,
+              a[1] + (((b[1] - a[1] + 540) % 360) - 180) * t];
+            const fraction = total ? lengths[i - 1] / total / steps : 1 / (leg.line.length - 1) / steps;
+            line.push(ll); distance += leg.distance * fraction; duration += leg.duration * fraction;
+            encounter(ll);
+            if (++samples % 1024 === 0) { progress('Checking portals along the walking path…'); await p.pause(0); }
+            if (!pending.size && !end && !closed) break trace;
+          }
+        }
+      }
+      if (pending.size) throw Error('Walking path does not reach every selected portal. Optimize again.');
+      if (end || closed) {
+        const portal = closed ? route[0] : end, last = line[line.length - 1];
+        if (p.distance(portal, {lat: last[0], lng: last[1]}) > 30.001)
+          throw Error('Walking path does not reach the required finish.');
+        visit(portal, last);
+      }
+      p.checkCancel();
+      return {route: closed ? ordered.slice(0, -1) : ordered, geometry: {legs, interactions,
+        distance: legs.reduce((sum, leg) => sum + leg.distance, 0),
+        duration: legs.reduce((sum, leg) => sum + leg.duration, 0)}};
+    };
+    p.visitAsYouPass = async (route, geometry, closed, endGuid, progress) => {
+      const original = geometry.distance;
+      let best = await p.firstEncounterWalk(route, geometry, closed, endGuid, progress);
+      // Reuse only fetched directed walking edges to remove now-unnecessary
+      // returns. Recheck first encounters after shortcuts change the trace.
+      for (let pass = 0; pass < 3; pass++) {
+        progress(`Shortening returns after early portal visits ${pass + 1}/3…`);
+        const walked = closed ? best.route.concat([best.route[0]]) : best.route;
+        const shortened = await p.rangeWalk(best.geometry, walked, progress);
+        const candidate = await p.firstEncounterWalk(best.route, shortened, closed, endGuid, progress);
+        if (candidate.geometry.distance > best.geometry.distance + 0.001) break;
+        const improvement = best.geometry.distance - candidate.geometry.distance;
+        const sameOrder = candidate.route.every((portal, i) => portal.guid === best.route[i].guid);
+        best = candidate;
+        if (sameOrder && improvement < 0.1) break;
+        await p.pause(0);
+      }
+      return {...best, info: `Visit-as-you-pass applied; ${Math.max(0, Math.round(original - best.geometry.distance))}m of walking removed. Chosen endpoints are preserved; first encounters are sampled every 5m or less.`};
+    };
     p.backtrackCandidates = (route, fixed, closed, matrix, points, limit = 6, endGuid = '') => {
       const index = new Map(points.map((v, i) => [v.guid, i]));
       const distance = (a, b) => matrix ? matrix[index.get(a.guid)][index.get(b.guid)] : p.distance(a, b);
@@ -470,6 +556,7 @@
       for (const i of positions) for (const j of positions) if (i < j) {
         consider(route.slice(0, i).concat(route.slice(i, j + 1).reverse(), route.slice(j + 1)));
         const moved = route.slice(), portal = moved.splice(i, 1)[0]; moved.splice(j, 0, portal); consider(moved);
+        const earlier = route.slice(), laterPortal = earlier.splice(j, 1)[0]; earlier.splice(i, 0, laterPortal); consider(earlier);
       }
       return {baseline, candidates};
     };
@@ -564,14 +651,16 @@
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.7.0', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.7.1', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.7.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
+      ui.innerHTML = `<p><strong>Mission Route Planner v0.7.1</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
         <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
         <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
         <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
         <div class="walking-settings" hidden><label>openrouteservice API key <input class="key" type="password" autocomplete="off" style="width:100%"></label>
-        <p><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Kept only until reload. Pedestrian calculation sends selected coordinates to openrouteservice. Maximum 300 portals. Large selections take longer and use more routing requests. If interrupted, Optimize reuses completed distance batches for the same selection until reload. Paths must be within 30m of portals. <a href="https://openrouteservice.org/" target="_blank" rel="noopener noreferrer">© openrouteservice</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.</p></div>
+        <p><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Kept only until reload. Pedestrian calculation sends selected coordinates to openrouteservice. Maximum 300 portals. Large selections take longer and use more routing requests. If interrupted, Optimize reuses completed distance batches for the same selection until reload. Paths must be within 30m of portals. <a href="https://openrouteservice.org/" target="_blank" rel="noopener noreferrer">© openrouteservice</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.</p>
+        <label style="display:block;margin-top:8px"><input class="visit-passing" type="checkbox" checked> Visit portals as you pass them</label>
+        <p>Visit selected portals when the walking path first comes within 30m. Keep the chosen start and finish, and shorten later returns where possible. Uses fetched paths without extra API requests. Nearby portals may share an interaction spot; review physical access on the map.</p></div>
         <label>Starting portal <select class="start" style="width:100%"><option value="">Automatic</option></select></label>
         <label>Ending portal <select class="end" style="width:100%"><option value="">Automatic</option></select></label>
         <p class="end-hint" hidden>Return-to-start is enabled: the route ends at its starting portal. The ending-portal selection is ignored.</p>
@@ -598,6 +687,7 @@
       on('.scan', p.scan);
       on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
       ui.querySelector('.backtracking').onchange = () => { p.invalidate(); p.say('Backtracking preference changed. Optimize again.'); };
+      ui.querySelector('.visit-passing').onchange = () => { p.invalidate(); p.say('Visit-as-you-pass preference changed. Optimize again.'); };
       ui.querySelector('.closed').onchange = () => {
         ui.querySelector('.end').disabled = ui.querySelector('.closed').checked;
         ui.querySelector('.end-hint').hidden = !ui.querySelector('.closed').checked;
@@ -626,7 +716,10 @@
           const rawMatrix = walking ? await p.walkMatrix(points, key, p.say) : points.map(a => points.map(b => p.distance(a, b)));
           // Pairwise disk-distance estimates guide ordering; the final path uses
           // consistent interaction positions, never these bounds as its total.
-          const matrix = rawMatrix.map(row => Array.from(row, d => Math.max(0, d - 60)));
+          const visitPassing = walking && ui.querySelector('.visit-passing').checked;
+          // Clamping every edge below 60m to zero erases order in dense groups.
+          // Start with mapped distances, then optimize actual interaction spots.
+          const matrix = visitPassing ? rawMatrix : rawMatrix.map(row => Array.from(row, d => Math.max(0, d - 60)));
           p.useInteractionRange = true;
           const closed = ui.querySelector('.closed').checked;
           let route = await p.optimize(points, fixed, p.say, matrix, closed, endGuid);
@@ -649,7 +742,12 @@
             const refined = await p.reduceBacktracking(route, fixed, closed, matrix, points, geometry, key, p.say, endGuid);
             route = refined.route; geometry = refined.geometry; backtrackingInfo = refined.info;
           }
-          p.checkCancel(); p.route = route; p.walk = geometry; p.interactionTravel = geometry || p.rangeStraight(route, closed); p.closed = closed; p.backtrackingEnabled = backtracking; p.backtrackingInfo = backtrackingInfo; p.draw();
+          if (visitPassing) {
+            const refined = await p.visitAsYouPass(route, geometry, closed, endGuid, p.say);
+            route = refined.route; geometry = refined.geometry;
+            backtrackingInfo = `${backtrackingInfo} ${refined.info}`.trim();
+          }
+          p.checkCancel(); p.route = route; p.walk = geometry; p.interactionTravel = geometry || p.rangeStraight(route, closed); p.closed = closed; p.backtrackingEnabled = backtracking || visitPassing; p.backtrackingInfo = backtrackingInfo; p.draw();
         } catch (e) { p.invalidate(); throw e; }
         finally {
           p.busy = false; p.controller = null;
@@ -677,7 +775,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.7.0'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.7.1'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
