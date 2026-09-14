@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.8.0
+// @version      0.8.1
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
@@ -383,6 +383,7 @@
       const starts = closed ? candidates[0].slice().sort((a, b) => a.offset - b.offset).filter((_, i, all) =>
         i === 0 || i % Math.max(1, Math.floor(all.length / 7)) === 0).slice(0, 8) : [null];
       let winner = null;
+      const failedStages = new Set();
       for (let trial = 0; trial < starts.length; trial++) {
         let active = new Map((starts[trial] ? [starts[trial]] : candidates[0]).map(v => [v.id, {distance: 0, offset: v.offset}]));
         const parents = []; let failed = false;
@@ -407,7 +408,7 @@
           parents.push(previous); active = new Map();
           const targets = closed && stage === candidates.length - 1 ? [starts[trial]] : candidates[stage];
           for (const target of targets) if (Number.isFinite(distances[target.id])) active.set(target.id, {distance: distances[target.id], offset: offsets[target.id] + target.offset});
-          if (!active.size) { failed = true; break; }
+          if (!active.size) { failedStages.add(stage); failed = true; break; }
           progress(`Applying 30m interaction range ${stage}/${candidates.length - 1}${closed ? ' (loop ' + (trial + 1) + '/' + starts.length + ')' : ''}…`); await p.pause(0);
         }
         if (failed) continue;
@@ -424,7 +425,16 @@
         }
         winner = {legs, interactions, distance: total.distance, offset: total.offset, duration: legs.reduce((sum, v) => sum + v.duration, 0)};
       }
-      if (!winner) throw Error('Could not form a continuous walking route within the 30m interaction areas.');
+      if (!winner) {
+        p.checkCancel();
+        const stages = [...failedStages].sort((a, b) => a - b);
+        const details = stages.slice(0, 5).map(stage => `${route[stage - 1].title} → ${route[stage].title}`).join('; ');
+        const warning = `30m interaction optimization could not connect ${stages.length} attempted transition${stages.length === 1 ? '' : 's'}${details ? ': ' + details : ''}${stages.length > 5 ? '; …' : ''}. Kept the available mapped walking legs. Review these connections; a closer approach or manual adjustment may be needed.`;
+        // Preserve the service's original legs and totals. Do not invent links
+        // between disconnected graph components or discard the whole route.
+        return {...geometry, interactionFallback: true,
+          warnings: [...new Set([...(geometry.warnings || []), warning])]};
+      }
       return winner;
     };
     // Count repeated mapped edges (coordinates rounded to ~0.1m).
@@ -517,6 +527,10 @@
         duration: legs.reduce((sum, leg) => sum + leg.duration, 0)}};
     };
     p.visitAsYouPass = async (route, geometry, closed, endGuid, progress) => {
+      // First-encounter ordering requires a continuous trace. Retain a usable
+      // service route when interaction optimization had to fall back.
+      if (geometry.interactionFallback) return {route, geometry,
+        info: 'Visit-as-you-pass skipped because the walking legs could not be joined within the interaction areas.'};
       const original = geometry.distance;
       let best = await p.firstEncounterWalk(route, geometry, closed, endGuid, progress);
       // Reuse only fetched directed walking edges to remove now-unnecessary
@@ -525,6 +539,10 @@
         progress(`Shortening returns after early portal visits ${pass + 1}/3…`);
         const walked = closed ? best.route.concat([best.route[0]]) : best.route;
         const shortened = await p.rangeWalk(best.geometry, walked, progress);
+        if (shortened.interactionFallback) {
+          best.geometry = shortened;
+          break;
+        }
         const candidate = await p.firstEncounterWalk(best.route, shortened, closed, endGuid, progress);
         if (candidate.geometry.distance > best.geometry.distance + 0.001) break;
         const improvement = best.geometry.distance - candidate.geometry.distance;
@@ -647,13 +665,13 @@
           .bindTooltip(label).addTo(p.preview);
       });
       const meters = p.route.slice(1).reduce((sum, v, i) => sum + p.distance(p.route[i], v), 0) + (p.closed ? p.distance(p.route[p.route.length - 1], p.route[0]) : 0);
-      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + ' km walking • ~' + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Walking distances calculated from mapped paths. Display lines show portal order, not walking directions.' : ''} Ready to export.`);
+      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + ' km walking • ~' + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Walking distances calculated from mapped paths. Display lines show portal order, not walking directions.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.7.1', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.8.1', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.7.1</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
+      ui.innerHTML = `<p><strong>Mission Route Planner v0.8.1</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
         <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
         <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
         <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
@@ -765,7 +783,7 @@
         const link = document.createElement('a'); link.href = url;
         link.download = (name.replace(/[^a-z0-9_-]/gi, '_') || 'missions') + '-umm.json';
         document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
-        p.say('Export downloaded. Back up any existing UMM plan, then import the JSON using UMM Opt.');
+        p.say('Export downloaded. Back up any existing UMM plan, then import the JSON using UMM Opt.' + (p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''));
       });
       p.open();
     };
@@ -775,7 +793,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.7.1'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.8.1'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
