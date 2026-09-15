@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.8.1
+// @version      0.9.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
@@ -638,10 +638,21 @@
       p.preview.clearLayers();
       const chunks = p.split(p.route, Number(p.ui.querySelector('.count').value), p.ui.querySelector('.shared').checked, p.closed);
       const colors = ['#ffb347', '#54d9ff', '#e08aff', '#7fe895', '#ff8093', '#fff07a'];
-      L.polyline(p.route.map(v => [v.lat, v.lng]), {color: '#aaa', weight: 2, dashArray: '5 8', interactive: false}).addTo(p.preview);
+      if (p.walk) {
+        // Separate lines preserve any gaps in fallback geometry. Draw first
+        // so mission links and portal markers remain above the walking trace.
+        L.polyline(p.walk.legs.map(leg => leg.line).filter(line => line.length > 1),
+          {color: '#a8adb2', weight: 3, opacity: 0.5, interactive: false}).addTo(p.preview);
+      } else {
+        L.polyline(p.route.map(v => [v.lat, v.lng]), {color: '#aaa', weight: 2, dashArray: '5 8', interactive: false}).addTo(p.preview);
+      }
       const legend = p.ui.querySelector('.legend');
       if (legend) {
         legend.replaceChildren();
+        if (p.walk) {
+          const item = document.createElement('div'); item.style.color = '#a8adb2';
+          item.textContent = 'Grey trace: calculated walking path'; legend.append(item);
+        }
         chunks.forEach((chunk, i) => {
           const item = document.createElement('div'); item.style.color = colors[i % colors.length];
           item.textContent = `● Mission ${i + 1}: ${chunk.length} waypoints`; legend.append(item);
@@ -665,13 +676,13 @@
           .bindTooltip(label).addTo(p.preview);
       });
       const meters = p.route.slice(1).reduce((sum, v, i) => sum + p.distance(p.route[i], v), 0) + (p.closed ? p.distance(p.route[p.route.length - 1], p.route[0]) : 0);
-      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + ' km walking • ~' + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Walking distances calculated from mapped paths. Display lines show portal order, not walking directions.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
+      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + ' km walking • ~' + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Grey trace shows the calculated walking path; colored links show portal visit order.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.8.1', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.9.0', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.8.1</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
+      ui.innerHTML = `<p><strong>Mission Route Planner v0.9.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
         <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
         <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
         <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
@@ -687,12 +698,12 @@
         <label style="display:block;margin-top:8px"><input class="closed" type="checkbox"> Start and end the entire route at the same portal</label>
         <label style="display:block;margin-top:8px"><input class="backtracking" type="checkbox"> Reduce backtracking</label>
         <p>Prefer less retracing. Pedestrian mode allows up to 20% extra distance and checks up to 5 alternatives and uses extra API requests. Straight-line mode discourages sharp reversals only.</p>
-        <p>Assumes interaction within 30m of each portal. Shorter travel takes priority; equally short approaches favor being closer. Display lines and exports retain the actual portal positions.</p>
+        <p>Assumes interaction within 30m of each portal. Shorter travel takes priority; equally short approaches favor being closer. Colored links and exports retain the actual portal positions; the grey walking trace shows the calculated approaches.</p>
         <p>Split all selected portals evenly, with at least 6 per mission. With the toggle on, adjacent missions share one endpoint, which counts in both missions. Return-to-start adds the starting portal as the final waypoint of the last mission. Each mission has at least 6 distinct portals before the return waypoint is added.</p>
         <label>Banner / mission name <input class="name" value="My mission" style="width:100%"></label>
         <label>Description <textarea class="description" rows="3" style="width:100%"></textarea></label>
         <button class="optimize">Optimize route</button> <button class="cancel" disabled>Cancel</button> <button class="export">Export UMM JSON</button>
-        <div class="legend" style="margin-top:8px"></div><p class="status" role="status" aria-live="polite">Straight-line mode makes no external requests. Pedestrian mode uses walking distances but displays straight mission-colored portal links.</p>`;
+        <div class="legend" style="margin-top:8px"></div><p class="status" role="status" aria-live="polite">Straight-line mode makes no external requests. Pedestrian mode shows a faint grey walking path beneath the mission-colored portal links.</p>`;
       const on = (selector, action) => { ui.querySelector(selector).onclick = async () => {
         if (p.busy) return;
         try { await action(); } catch (e) { p.say(e.message); }
@@ -793,7 +804,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.8.1'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.9.0'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
