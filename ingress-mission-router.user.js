@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.9.0
+// @version      0.10.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
@@ -95,13 +95,14 @@
         box.checked = !p.excluded.has(portal.guid);
         box.onchange = () => {
           if (box.checked) p.excluded.delete(portal.guid); else p.excluded.add(portal.guid);
-          p.invalidate(); p.say('Selection changed. Optimize again before exporting.');
+          p.syncBannerCount(); p.invalidate(); p.say('Selection changed. Optimize again before exporting.');
         };
         label.append(box, document.createTextNode(' ' + portal.title)); list.append(label);
         start.add(new Option(portal.title, portal.guid)); end.add(new Option(portal.title, portal.guid));
       }
       if (p.pool.has(oldStart)) start.value = oldStart;
       if (p.pool.has(oldEnd)) end.value = oldEnd;
+      p.syncBannerCount();
     };
     p.checkCancel = () => { if (p.controller?.signal.aborted) throw Error('Calculation cancelled.'); };
     p.pause = async ms => { await new Promise(resolve => setTimeout(resolve, ms)); p.checkCancel(); };
@@ -609,6 +610,29 @@
       return {route: best.route, geometry: best.geometry,
         info: `Matched retraced paths: ${Math.round(original.repeated)}m → ${Math.round(best.repeated)}m. Backtracking search is approximate.`};
     };
+    p.maxBannerLength = (portalCount, sharedEndpoints = false) => {
+      // Shared boundaries reuse one portal: M missions need 5M + 1
+      // unique portals instead of 6M. A closing revisit adds no capacity.
+      const capacity = sharedEndpoints ? Math.floor((portalCount - 1) / 5) : Math.floor(portalCount / 6);
+      return Math.max(0, Math.floor(capacity / 6) * 6);
+    };
+    p.syncBannerCount = (required = false) => {
+      const ui = p.ui, input = ui.querySelector('.count');
+      const automatic = ui.querySelector('.maximize-banner').checked;
+      const hint = ui.querySelector('.banner-hint');
+      input.disabled = p.busy || automatic;
+      hint.hidden = !automatic;
+      if (!automatic) return Number(input.value);
+      const selected = [...p.pool.keys()].filter(guid => !p.excluded.has(guid)).length;
+      const shared = ui.querySelector('.shared').checked;
+      const count = p.maxBannerLength(selected, shared);
+      input.value = count ? String(count) : '';
+      hint.textContent = count
+        ? `${count} missions (${count / 6} rows of 6) from ${selected} selected portals, with at least 6 distinct portals per mission.`
+        : `A 6-mission banner needs at least ${shared ? 31 : 36} selected portals${shared ? ' with shared endpoints' : ''}; currently ${selected}. Scan more portals, adjust the selection, or turn off maximization.`;
+      if (required && !count) throw Error(hint.textContent);
+      return count;
+    };
     p.split = (route, count, sharedEndpoints = false, closed = false) => {
       const slots = route.length + (sharedEndpoints ? count - 1 : 0);
       if (!Number.isInteger(count) || count < 1 || slots < 6 * count)
@@ -636,7 +660,7 @@
     });
     p.draw = () => {
       p.preview.clearLayers();
-      const chunks = p.split(p.route, Number(p.ui.querySelector('.count').value), p.ui.querySelector('.shared').checked, p.closed);
+      const chunks = p.split(p.route, p.syncBannerCount(true), p.ui.querySelector('.shared').checked, p.closed);
       const colors = ['#ffb347', '#54d9ff', '#e08aff', '#7fe895', '#ff8093', '#fff07a'];
       if (p.walk) {
         // Separate lines preserve any gaps in fallback geometry. Draw first
@@ -680,9 +704,9 @@
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.9.0', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.10.0', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.9.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
+      ui.innerHTML = `<p><strong>Mission Route Planner v0.10.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
         <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
         <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
         <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
@@ -694,6 +718,9 @@
         <label>Ending portal <select class="end" style="width:100%"><option value="">Automatic</option></select></label>
         <p class="end-hint" hidden>Return-to-start is enabled: the route ends at its starting portal. The ending-portal selection is ignored.</p>
         <label>Mission count <input class="count" type="number" min="1" step="1" value="1" style="width:60px"></label>
+        <label style="display:block;margin-top:8px"><input class="maximize-banner" type="checkbox"> Maximize banner length</label>
+        <p>Automatically choose 6, 12, 18… missions using all selected portals, with at least 6 distinct portals in each mission. Shared endpoints can support a longer banner; return-to-start does not add a distinct portal.</p>
+        <p class="banner-hint" role="status" aria-live="polite" hidden></p>
         <label style="display:block;margin-top:8px"><input class="shared" type="checkbox"> Start each next mission at the previous mission’s last portal</label>
         <label style="display:block;margin-top:8px"><input class="closed" type="checkbox"> Start and end the entire route at the same portal</label>
         <label style="display:block;margin-top:8px"><input class="backtracking" type="checkbox"> Reduce backtracking</label>
@@ -725,12 +752,17 @@
       ui.querySelector('.end').onchange = () => { p.invalidate(); p.say('End portal changed. Optimize again.'); };
       ui.querySelector('.start').onchange = () => { p.invalidate(); p.say('Start changed. Optimize again.'); };
       ui.querySelector('.shared').onchange = ui.querySelector('.count').onchange = () => {
-        try { if (p.route) p.draw(); } catch (e) { p.preview.clearLayers(); p.say(e.message); }
+        try { p.syncBannerCount(true); if (p.route) p.draw(); } catch (e) { p.preview.clearLayers(); p.say(e.message); }
+      };
+      ui.querySelector('.maximize-banner').onchange = () => {
+        if (ui.querySelector('.maximize-banner').checked) p.manualMissionCount = ui.querySelector('.count').value;
+        else ui.querySelector('.count').value = p.manualMissionCount || '1';
+        try { p.syncBannerCount(true); if (p.route) p.draw(); } catch (e) { p.preview.clearLayers(); p.say(e.message); }
       };
       on('.optimize', async () => {
         p.invalidate();
         const points = [...p.pool.values()].filter(v => !p.excluded.has(v.guid));
-        p.split(points, Number(ui.querySelector('.count').value), ui.querySelector('.shared').checked);
+        p.split(points, p.syncBannerCount(true), ui.querySelector('.shared').checked);
         p.controller = new AbortController();
         p.busy = true; ui.querySelectorAll('input,select,button,textarea').forEach(el => el.disabled = true);
         ui.querySelector('.cancel').disabled = false;
@@ -783,13 +815,14 @@
           ui.querySelectorAll('input,select,button,textarea').forEach(el => el.disabled = false);
           ui.querySelector('.cancel').disabled = true;
           ui.querySelector('.end').disabled = ui.querySelector('.closed').checked;
+          p.syncBannerCount();
         }
       });
       on('.export', () => {
         if (!p.route) throw Error('Optimize the current selection first.');
         const name = ui.querySelector('.name').value.trim();
         if (!name) throw Error('Enter a banner or mission name.');
-        const state = p.exportState(p.route, Number(ui.querySelector('.count').value), name, ui.querySelector('.description').value, ui.querySelector('.shared').checked, p.closed);
+        const state = p.exportState(p.route, p.syncBannerCount(true), name, ui.querySelector('.description').value, ui.querySelector('.shared').checked, p.closed);
         const url = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], {type: 'application/json'}));
         const link = document.createElement('a'); link.href = url;
         link.download = (name.replace(/[^a-z0-9_-]/gi, '_') || 'missions') + '-umm.json';
@@ -804,7 +837,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.9.0'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.10.0'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
