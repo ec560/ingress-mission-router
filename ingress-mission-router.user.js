@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.10.0
+// @version      0.11.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
@@ -14,7 +14,8 @@
  * An ORS API key is required (kept in page memory only). Coordinates go to ORS.
  * Exact visit order for <=16 portals under the returned matrix, heuristic above.
  * ORS chooses the paths; this is not a proof of the globally shortest walk.
- * Network snapping is limited to 30m; review access between paths and portals.
+ * Portals 40m or more from mapped paths use straight-line estimates.
+ * Interaction optimization uses 30m; review access between paths and portals.
  * Only loaded named portals are collected. Scan again after panning/zooming
  * to accumulate more portals. Collection persists only until page reload.
  * Export uses UMM 0.7.3 fileFormatVersion 2 (verified against its source at
@@ -152,19 +153,44 @@
       if (!key) throw Error('Enter an openrouteservice API key for pedestrian routing.');
       if (points.length > 300) throw Error('Pedestrian mode currently supports up to 300 selected portals.');
       const signature = JSON.stringify(points.map(v => [v.guid, v.lng, v.lat]));
-      if (p.walkCache?.signature === signature) return p.walkCache.matrix;
+      if (p.walkCache?.signature === signature) { p.walkAccess = p.walkCache.access; return p.walkCache.matrix; }
       const n = points.length;
       if (p.matrixProgressCache?.signature !== signature) p.matrixProgressCache = {
-        signature, matrix: Array.from({length: n}, () => new Float64Array(n)), completed: new Set()
+        signature, matrix: points.map(a => Float64Array.from(points, b => p.distance(a, b))),
+        completed: new Set(), access: null
       };
       const partial = p.matrixProgressCache, matrix = partial.matrix;
-      const blocks = Math.ceil(n / 50); let completed = 0;
-      for (let a = 0; a < n; a += 50) for (let b = 0; b < n; b += 50) {
+      if (!partial.access) {
+        progress('Checking for mapped walking paths within 40m of portals…');
+        const data = await p.request('snap/foot-walking/json', {
+          locations: points.map(v => [v.lng, v.lat]), radius: 40
+        }, key);
+        if (!Array.isArray(data.locations) || data.locations.length !== n)
+          throw Error('Walking service returned incomplete path proximity information.');
+        const access = new Map();
+        points.forEach((portal, i) => {
+          const snapped = data.locations[i];
+          if (snapped === null) { access.set(portal.guid, {offPath: true, distance: null}); return; }
+          const loc = snapped?.location;
+          if (!Array.isArray(loc) || !Number.isFinite(loc[0]) || !Number.isFinite(loc[1]))
+            throw Error('Walking service returned invalid path proximity information.');
+          const distance = Number.isFinite(snapped.snapped_distance) && snapped.snapped_distance >= 0
+            ? snapped.snapped_distance : p.distance(portal, {lng: loc[0], lat: loc[1]});
+          access.set(portal.guid, {location: loc, distance, offPath: distance >= 40});
+        });
+        partial.access = access;
+      }
+      p.walkAccess = partial.access;
+      const onPath = points.map((portal, index) => ({portal, index})).filter(v => !p.walkAccess.get(v.portal.guid).offPath);
+      const blocks = Math.ceil(onPath.length / 50); let completed = 0;
+      // Only reachable portals go to the matrix service. All other pairs keep
+      // their straight-line estimates instead of failing the complete matrix.
+      for (let a = 0; a < onPath.length; a += 50) for (let b = 0; b < onPath.length; b += 50) {
         p.checkCancel();
         const block = a + ':' + b;
         if (partial.completed.has(block)) { completed++; continue; }
-        const sources = points.slice(a, a + 50), destinations = points.slice(b, b + 50);
-        const locations = sources.concat(destinations).map(v => [v.lng, v.lat]);
+        const sources = onPath.slice(a, a + 50), destinations = onPath.slice(b, b + 50);
+        const locations = sources.concat(destinations).map(v => p.walkAccess.get(v.portal.guid).location);
         progress(`Fetching walking distances ${++completed}/${blocks * blocks}…`);
         const data = await p.request('matrix/foot-walking', {locations,
           sources: sources.map((_, i) => String(i)),
@@ -172,33 +198,79 @@
           metrics: ['distance'], units: 'm'}, key);
         for (const [items, snapped] of [[sources, data.sources], [destinations, data.destinations]]) {
           if (!Array.isArray(snapped) || snapped.length !== items.length) throw Error('Walking service omitted portal snapping information.');
-          items.forEach((portal, i) => {
+          items.forEach(({portal}, i) => {
             const loc = snapped[i]?.location;
             if (!Array.isArray(loc) || !Number.isFinite(loc[0]) || !Number.isFinite(loc[1]) ||
-                p.distance(portal, {lng: loc[0], lat: loc[1]}) > 30)
-              throw Error(`No mapped walking path within 30m of: ${portal.title}. Exclude this portal or review its location.`);
+                p.distance({lng: p.walkAccess.get(portal.guid).location[0], lat: p.walkAccess.get(portal.guid).location[1]}, {lng: loc[0], lat: loc[1]}) > 1)
+              throw Error(`Walking service could not use the checked path near ${portal.title}. Retry the calculation.`);
           });
         }
         if (!Array.isArray(data.distances) || data.distances.length !== sources.length) throw Error('Invalid walking distance response.');
         for (let i = 0; i < sources.length; i++) for (let j = 0; j < destinations.length; j++) {
           const value = data.distances[i]?.[j];
           if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
-            throw Error(`No walking connection: ${sources[i].title} → ${destinations[j].title}. Exclude disconnected portals and retry.`);
-          matrix[a + i][b + j] = value;
+            throw Error(`No walking connection: ${sources[i].portal.title} → ${destinations[j].portal.title}. Exclude disconnected portals and retry.`);
+          matrix[sources[i].index][destinations[j].index] = value;
         }
         partial.completed.add(block);
       }
-      p.walkCache = {signature, matrix}; p.matrixProgressCache = null; return matrix;
+      p.checkCancel();
+      p.walkCache = {signature, matrix, access: partial.access}; p.matrixProgressCache = null; return matrix;
+    };
+    p.pathPosition = portal => {
+      const access = p.walkAccess?.get(portal.guid);
+      return access && !access.offPath ? access.location : [portal.lng, portal.lat];
+    };
+    p.summarizeWalk = (legs, warnings = []) => ({legs,
+      distance: legs.reduce((sum, leg) => sum + leg.distance, 0),
+      duration: legs.reduce((sum, leg) => sum + leg.duration, 0),
+      estimatedDistance: legs.reduce((sum, leg) => sum + (leg.estimated ? leg.distance : 0), 0),
+      hasEstimates: legs.some(leg => leg.estimated), warnings: [...new Set(warnings)]});
+    p.joinEstimatedLegs = (legs, closed = false) => {
+      // End estimates at the actual mapped geometry, including any shift made
+      // by interaction optimization. Never insert estimates into the path graph.
+      return legs.map((leg, i) => {
+        if (!leg.estimated) return leg;
+        const previous = i > 0 ? legs[i - 1] : closed ? legs.at(-1) : null;
+        const next = i + 1 < legs.length ? legs[i + 1] : closed ? legs[0] : null;
+        const a = previous && !previous.estimated ? previous.line.at(-1) : leg.line[0];
+        const b = next && !next.estimated ? next.line[0] : leg.line.at(-1);
+        const distance = p.distance({lat: a[0], lng: a[1]}, {lat: b[0], lng: b[1]});
+        return {line: [a, b], distance, duration: distance / 1.4, estimated: true};
+      });
     };
     p.walkGeometry = async (route, key, progress) => {
+      const offPath = portal => p.walkAccess?.get(portal.guid)?.offPath;
+      if (!route.some(offPath)) return p.mappedWalkGeometry(route, key, progress);
+      const legs = [], warnings = [];
+      for (const portal of new Map(route.filter(offPath).map(v => [v.guid, v])).values()) {
+        const distance = p.walkAccess.get(portal.guid).distance;
+        warnings.push(`${portal.title}: ${distance === null ? 'no mapped walking path within 40m' : distance.toFixed(1) + 'm from the mapped walking path'}. Using straight-line estimates until the route returns to a mapped path.`);
+      }
+      progress(`Warning: ${warnings.join(' ')}`);
+      for (let i = 0; i < route.length - 1;) {
+        p.checkCancel();
+        if (offPath(route[i]) || offPath(route[i + 1])) {
+          const line = [p.pathPosition(route[i]), p.pathPosition(route[i + 1])].map(v => [v[1], v[0]]);
+          legs.push({line, distance: 0, duration: 0, estimated: true}); i++;
+        } else {
+          let end = i + 1;
+          while (end + 1 < route.length && !offPath(route[end + 1])) end++;
+          const mapped = await p.mappedWalkGeometry(route.slice(i, end + 1), key, progress);
+          legs.push(...mapped.legs); warnings.push(...(mapped.warnings || [])); i = end;
+        }
+      }
+      return p.summarizeWalk(p.joinEstimatedLegs(legs, route[0].guid === route.at(-1).guid), warnings);
+    };
+    p.mappedWalkGeometry = async (route, key, progress) => {
       const legs = [];
       // Overlapping chunks preserve the link between missions and API batches.
       for (let offset = 0; offset < route.length - 1; offset += 49) {
         const chunk = route.slice(offset, offset + 50);
         progress(`Fetching walking path ${offset + 1}–${offset + chunk.length}…`);
         const data = await p.request('directions/foot-walking/geojson', {
-          coordinates: chunk.map(v => [v.lng, v.lat]), preference: 'recommended',
-          radiuses: chunk.map(() => 30), instructions: true, units: 'm'
+          coordinates: chunk.map(p.pathPosition), preference: 'recommended',
+          radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
         }, key);
         const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
         const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
@@ -216,7 +288,7 @@
             return [c[1], c[0]];
           });
           for (const [portal, ll] of [[chunk[i], line[0]], [chunk[i + 1], line[line.length - 1]]])
-            if (p.distance(portal, {lat: ll[0], lng: ll[1]}) > 30.001) throw Error(`Walking path ends too far from ${portal.title}.`);
+            if (p.distance(portal, {lat: ll[0], lng: ll[1]}) > 40.001) throw Error(`Walking path ends too far from ${portal.title}.`);
           legs.push({line, distance: segment.distance, duration: segment.duration});
         });
       }
@@ -344,6 +416,7 @@
     // shortest walk through portal interaction disks in the chosen order.
     // No invented cross-country links: only traversed service edges are used.
     p.rangeWalk = async (geometry, route, progress) => {
+      if (geometry.hasEstimates) throw Error('Straight-line estimates must be optimized separately from mapped paths.');
       const nodes = [], edges = [], ids = new Map();
       const node = ll => {
         const key = ll.map(v => v.toFixed(7)).join(',');
@@ -374,7 +447,11 @@
       for (const portal of route) {
         const values = [];
         nodes.forEach((v, i) => { const d = p.distance(portal, v); if (d <= 30) values.push({id: i, offset: d}); });
-        if (!values.length) throw Error(`No verified walking position within 30m of ${portal.title}.`);
+        if (!values.length) {
+          p.checkCancel();
+          return {...geometry, interactionFallback: true, warnings: [...(geometry.warnings || []),
+            `No verified walking position within 30m of ${portal.title}. Kept mapped walking directions; review the approach from the path to this portal.`]};
+        }
         candidates.push(values);
         if (candidates.length % 8 === 0) await p.pause(0);
       }
@@ -444,7 +521,7 @@
     p.retracing = geometry => {
       const seen = new Map(); let repeated = 0, reversed = 0;
       const vertex = ll => ll.map(v => Number(v).toFixed(6)).join(',');
-      for (const leg of geometry.legs) for (let i = 1; i < leg.line.length; i++) {
+      for (const leg of geometry.legs.filter(leg => !leg.estimated)) for (let i = 1; i < leg.line.length; i++) {
         const a = leg.line[i - 1], b = leg.line[i], ak = vertex(a), bk = vertex(b);
         if (ak === bk) continue;
         const forward = ak < bk, key = forward ? ak + '|' + bk : bk + '|' + ak;
@@ -528,6 +605,31 @@
         duration: legs.reduce((sum, leg) => sum + leg.duration, 0)}};
     };
     p.visitAsYouPass = async (route, geometry, closed, endGuid, progress) => {
+      if (geometry.hasEstimates) {
+        // Refine each mapped run independently, fixing its boundary portals.
+        // An estimated crossing is never evidence that a portal is accessible.
+        const walked = closed ? route.concat([route[0]]) : route;
+        const ordered = [walked[0]], legs = [], warnings = [...(geometry.warnings || [])];
+        for (let i = 0; i < geometry.legs.length;) {
+          p.checkCancel();
+          if (geometry.legs[i].estimated) {
+            legs.push(geometry.legs[i]); ordered.push(walked[i + 1]); i++;
+          } else {
+            let end = i + 1;
+            while (end < geometry.legs.length && !geometry.legs[end].estimated) end++;
+            const segment = walked.slice(i, end + 1), mapped = p.summarizeWalk(geometry.legs.slice(i, end));
+            // Recheck interaction feasibility because a mapped run may have
+            // retained its original geometry after a 30m optimization fallback.
+            const ranged = await p.rangeWalk(mapped, segment, progress);
+            const refined = await p.visitAsYouPass(segment, ranged, false, segment.at(-1).guid, progress);
+            ordered.push(...refined.route.slice(1)); legs.push(...refined.geometry.legs);
+            warnings.push(...(refined.geometry.warnings || [])); i = end;
+          }
+        }
+        return {route: closed ? ordered.slice(0, -1) : ordered,
+          geometry: p.summarizeWalk(p.joinEstimatedLegs(legs, closed), warnings),
+          info: 'Visit-as-you-pass applied to mapped sections only. Straight-line sections remain estimates.'};
+      }
       // First-encounter ordering requires a continuous trace. Retain a usable
       // service route when interaction optimization had to fall back.
       if (geometry.interactionFallback) return {route, geometry,
@@ -665,8 +767,10 @@
       if (p.walk) {
         // Separate lines preserve any gaps in fallback geometry. Draw first
         // so mission links and portal markers remain above the walking trace.
-        L.polyline(p.walk.legs.map(leg => leg.line).filter(line => line.length > 1),
+        L.polyline(p.walk.legs.filter(leg => !leg.estimated).map(leg => leg.line).filter(line => line.length > 1),
           {color: '#a8adb2', weight: 3, opacity: 0.5, interactive: false}).addTo(p.preview);
+        if (p.walk.hasEstimates) L.polyline(p.walk.legs.filter(leg => leg.estimated).map(leg => leg.line),
+          {color: '#a8adb2', weight: 3, opacity: 0.7, dashArray: '6 7', interactive: false}).addTo(p.preview);
       } else {
         L.polyline(p.route.map(v => [v.lat, v.lng]), {color: '#aaa', weight: 2, dashArray: '5 8', interactive: false}).addTo(p.preview);
       }
@@ -676,6 +780,11 @@
         if (p.walk) {
           const item = document.createElement('div'); item.style.color = '#a8adb2';
           item.textContent = 'Grey trace: calculated walking path'; legend.append(item);
+          if (p.walk.hasEstimates) {
+            const estimate = document.createElement('div'); estimate.style.color = '#a8adb2';
+            estimate.textContent = `Dashed grey: straight-line estimates (${(p.walk.estimatedDistance / 1000).toFixed(2)} km; time estimated at 1.4 m/s)`;
+            legend.append(estimate);
+          }
         }
         chunks.forEach((chunk, i) => {
           const item = document.createElement('div'); item.style.color = colors[i % colors.length];
@@ -695,23 +804,24 @@
         const missions = memberships.get(portal.guid), shared = missions.length > 1;
         const label = document.createElement('span');
         label.textContent = `${i + 1}. ${portal.title} • Mission ${missions.map(m => m + 1).join(' / ')}${shared ? ' (shared end/start)' : ''}${p.closed && i === 0 ? ' • ROUTE START / FINISH' : ''}`;
+        if (p.walk && p.walkAccess?.get(portal.guid)?.offPath) label.textContent += ' • No mapped path closer than 40m; straight-line estimate';
         L.circleMarker([portal.lat, portal.lng], {radius: shared ? 8 : 5,
           color: shared ? '#fff' : colors[missions[0] % colors.length], fillOpacity: 1})
           .bindTooltip(label).addTo(p.preview);
       });
       const meters = p.route.slice(1).reduce((sum, v, i) => sum + p.distance(p.route[i], v), 0) + (p.closed ? p.distance(p.route[p.route.length - 1], p.route[0]) : 0);
-      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + ' km walking • ~' + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Grey trace shows the calculated walking path; colored links show portal visit order.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
+      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + (p.walk.hasEstimates ? ' km total (includes straight-line estimates) • ~' : ' km walking • ~') + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Solid grey shows mapped walking paths; dashed grey shows straight-line estimates where needed. Colored links show portal visit order.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.10.0', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.0', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.10.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
+      ui.innerHTML = `<p><strong>Mission Route Planner v0.11.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
         <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
         <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
         <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
         <div class="walking-settings" hidden><label>openrouteservice API key <input class="key" type="password" autocomplete="off" style="width:100%"></label>
-        <p><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Kept only until reload. Pedestrian calculation sends selected coordinates to openrouteservice. Maximum 300 portals. Large selections take longer and use more routing requests. If interrupted, Optimize reuses completed distance batches for the same selection until reload. Paths must be within 30m of portals. <a href="https://openrouteservice.org/" target="_blank" rel="noopener noreferrer">© openrouteservice</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.</p>
+        <p><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Kept only until reload. Pedestrian calculation sends selected coordinates to openrouteservice. Maximum 300 portals. Large selections take longer and use more routing requests. If interrupted, Optimize reuses completed distance batches for the same selection until reload. Portals 40m or more from a mapped walking path use straight-line estimates, with a warning. Walking directions resume when the route returns to path-accessible portals. Each new selection includes a path proximity API request. <a href="https://openrouteservice.org/" target="_blank" rel="noopener noreferrer">© openrouteservice</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.</p>
         <label style="display:block;margin-top:8px"><input class="visit-passing" type="checkbox" checked> Visit portals as you pass them</label>
         <p>Visit selected portals when the walking path first comes within 30m. Keep the chosen start and finish, and shorten later returns where possible. Uses fetched paths without extra API requests. Nearby portals may share an interaction spot; review physical access on the map.</p></div>
         <label>Starting portal <select class="start" style="width:100%"><option value="">Automatic</option></select></label>
@@ -741,7 +851,7 @@
         p.invalidate(); p.say('Routing mode changed. Optimize again.');
       };
       on('.scan', p.scan);
-      on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
+      on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.walkAccess = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
       ui.querySelector('.backtracking').onchange = () => { p.invalidate(); p.say('Backtracking preference changed. Optimize again.'); };
       ui.querySelector('.visit-passing').onchange = () => { p.invalidate(); p.say('Visit-as-you-pass preference changed. Optimize again.'); };
       ui.querySelector('.closed').onchange = () => {
@@ -837,7 +947,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.10.0'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.0'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
