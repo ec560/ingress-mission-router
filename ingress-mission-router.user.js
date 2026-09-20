@@ -1,27 +1,12 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.0
+// @version      0.11.1
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @grant        none
 // ==/UserScript==
 
-/* Install alongside IITC and Draw Tools 0.12.1. Open Mission Route Planner in
- * the toolbox. Draw a polygon, rectangle or circle, scan, choose portals and
- * mission count, optimize, then export. Import through UMM Opt > Choose file.
- * Walking mode uses openrouteservice foot-walking distances and route geometry.
- * An ORS API key is required (kept in page memory only). Coordinates go to ORS.
- * Exact visit order for <=16 portals under the returned matrix, heuristic above.
- * ORS chooses the paths; this is not a proof of the globally shortest walk.
- * Portals 40m or more from mapped paths use straight-line estimates.
- * Interaction optimization uses 30m; review access between paths and portals.
- * Only loaded named portals are collected. Scan again after panning/zooming
- * to accumulate more portals. Collection persists only until page reload.
- * Export uses UMM 0.7.3 fileFormatVersion 2 (verified against its source at
- * https://umm.8bitnoise.rocks/plugin/iitc-ultimate-mission-maker.user.js).
- * No changes are made to UMM data or Draw Tools layers by this plugin.
- */
 (function () {
   'use strict';
   function wrapper() {
@@ -82,7 +67,7 @@
         p.pool.set(guid, {guid, title: d.title, imageUrl: d.image || '', lat: ll.lat, lng: ll.lng});
       }
       p.invalidate(); p.renderPortals();
-      p.say(`${p.pool.size} named portals collected. ${unnamed} loaded placeholders skipped. Pan/zoom and scan again to collect more. Coverage is not guaranteed.`);
+      p.say(`${p.pool.size} named portal${p.pool.size === 1 ? '' : 's'} ready.${unnamed ? ` ${unnamed} unnamed portal${unnamed === 1 ? '' : 's'} not included.` : ''} If any portals are missing, pan to load them and scan again.`);
     };
     p.renderPortals = () => {
       const list = p.ui.querySelector('.portals');
@@ -100,6 +85,10 @@
         };
         label.append(box, document.createTextNode(' ' + portal.title)); list.append(label);
         start.add(new Option(portal.title, portal.guid)); end.add(new Option(portal.title, portal.guid));
+      }
+      if (!p.pool.size) {
+        const empty = document.createElement('p'); empty.className = 'mr-empty';
+        empty.textContent = 'No portals collected yet.'; list.append(empty);
       }
       if (p.pool.has(oldStart)) start.value = oldStart;
       if (p.pool.has(oldEnd)) end.value = oldEnd;
@@ -810,37 +799,67 @@
           .bindTooltip(label).addTo(p.preview);
       });
       const meters = p.route.slice(1).reduce((sum, v, i) => sum + p.distance(p.route[i], v), 0) + (p.closed ? p.distance(p.route[p.route.length - 1], p.route[0]) : 0);
-      p.say(`${p.route.length} unique portals • ${chunks.length} missions (${chunks.map(c => c.length).join(', ')} portals) • ${p.walk ? (p.walk.distance / 1000).toFixed(2) + (p.walk.hasEstimates ? ' km total (includes straight-line estimates) • ~' : ' km walking • ~') + Math.round(p.walk.duration / 60) + ' min moving time' : ((p.interactionTravel?.distance ?? meters) / 1000).toFixed(2) + ' km within interaction range'} including mission transitions${p.closed ? ' and return to start' : ''}. ${p.ui.querySelector('.shared').checked ? 'Shared mission endpoints enabled.' : ''} 30m interaction range. ${p.backtrackingEnabled ? p.backtrackingInfo : 'Approximate visit order.'} ${p.walk ? 'Solid grey shows mapped walking paths; dashed grey shows straight-line estimates where needed. Colored links show portal visit order.' : ''} Ready to export.${p.walk?.warnings?.length ? ' Warning: ' + p.walk.warnings.join(' ') : ''}`);
+      const distance = p.walk ? p.walk.distance : (p.interactionTravel?.distance ?? meters);
+      const result = [`Ready to export: ${p.route.length} portals in ${chunks.length} mission${chunks.length === 1 ? '' : 's'}`,
+        `mission sizes ${chunks.map(c => c.length).join(', ')}`,
+        `${(distance / 1000).toFixed(2)} km${p.walk ? ` (~${Math.round(p.walk.duration / 60)} min moving)` : ' estimated'}`];
+      if (p.closed) result.push('returns to start');
+      if (p.ui.querySelector('.shared').checked) result.push('shared mission endpoints');
+      if (p.walk?.hasEstimates) result.push(`${(p.walk.estimatedDistance / 1000).toFixed(2)} km uses straight-line estimates`);
+      if (p.backtrackingEnabled && p.backtrackingInfo) result.push(p.backtrackingInfo.replace(/[.\s]+$/, ''));
+      let summary = result.join(' • ') + '.';
+      if (p.walk?.warnings?.length) summary += ` Review: ${p.walk.warnings.join(' ')}`;
+      p.say(summary);
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.0', html: p.ui, width: 440}); return; }
+      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.1', html: p.ui, width: 440}); return; }
       const ui = p.ui = document.createElement('div');
-      ui.innerHTML = `<p><strong>Mission Route Planner v0.11.0</strong></p><p>Draw areas, then scan loaded portals. Multiple areas are combined. Scan again after panning to collect more portals.</p>
-        <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
-        <div class="portals" style="max-height:180px;overflow:auto;margin:10px 0"></div>
-        <label>Routing <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths (optional)</option></select></label>
-        <div class="walking-settings" hidden><label>openrouteservice API key <input class="key" type="password" autocomplete="off" style="width:100%"></label>
-        <p><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Kept only until reload. Pedestrian calculation sends selected coordinates to openrouteservice. Maximum 300 portals. Large selections take longer and use more routing requests. If interrupted, Optimize reuses completed distance batches for the same selection until reload. Portals 40m or more from a mapped walking path use straight-line estimates, with a warning. Walking directions resume when the route returns to path-accessible portals. Each new selection includes a path proximity API request. <a href="https://openrouteservice.org/" target="_blank" rel="noopener noreferrer">© openrouteservice</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.</p>
-        <label style="display:block;margin-top:8px"><input class="visit-passing" type="checkbox" checked> Visit portals as you pass them</label>
-        <p>Visit selected portals when the walking path first comes within 30m. Keep the chosen start and finish, and shorten later returns where possible. Uses fetched paths without extra API requests. Nearby portals may share an interaction spot; review physical access on the map.</p></div>
-        <label>Starting portal <select class="start" style="width:100%"><option value="">Automatic</option></select></label>
-        <label>Ending portal <select class="end" style="width:100%"><option value="">Automatic</option></select></label>
-        <p class="end-hint" hidden>Return-to-start is enabled: the route ends at its starting portal. The ending-portal selection is ignored.</p>
-        <label>Mission count <input class="count" type="number" min="1" step="1" value="1" style="width:60px"></label>
-        <label style="display:block;margin-top:8px"><input class="maximize-banner" type="checkbox"> Maximize banner length</label>
-        <p>Automatically choose 6, 12, 18… missions using all selected portals, with at least 6 distinct portals in each mission. Shared endpoints can support a longer banner; return-to-start does not add a distinct portal.</p>
-        <p class="banner-hint" role="status" aria-live="polite" hidden></p>
-        <label style="display:block;margin-top:8px"><input class="shared" type="checkbox"> Start each next mission at the previous mission’s last portal</label>
-        <label style="display:block;margin-top:8px"><input class="closed" type="checkbox"> Start and end the entire route at the same portal</label>
-        <label style="display:block;margin-top:8px"><input class="backtracking" type="checkbox"> Reduce backtracking</label>
-        <p>Prefer less retracing. Pedestrian mode allows up to 20% extra distance and checks up to 5 alternatives and uses extra API requests. Straight-line mode discourages sharp reversals only.</p>
-        <p>Assumes interaction within 30m of each portal. Shorter travel takes priority; equally short approaches favor being closer. Colored links and exports retain the actual portal positions; the grey walking trace shows the calculated approaches.</p>
-        <p>Split all selected portals evenly, with at least 6 per mission. With the toggle on, adjacent missions share one endpoint, which counts in both missions. Return-to-start adds the starting portal as the final waypoint of the last mission. Each mission has at least 6 distinct portals before the return waypoint is added.</p>
-        <label>Banner / mission name <input class="name" value="My mission" style="width:100%"></label>
-        <label>Description <textarea class="description" rows="3" style="width:100%"></textarea></label>
-        <button class="optimize">Optimize route</button> <button class="cancel" disabled>Cancel</button> <button class="export">Export UMM JSON</button>
-        <div class="legend" style="margin-top:8px"></div><p class="status" role="status" aria-live="polite">Straight-line mode makes no external requests. Pedestrian mode shows a faint grey walking path beneath the mission-colored portal links.</p>`;
+      ui.className = 'mission-router-ui';
+      ui.innerHTML = `<style>
+        .mission-router-ui h3,.mission-router-ui h4{margin:0 0 6px}.mission-router-ui h3 small{font-weight:normal;opacity:.7}
+        .mission-router-ui section{margin:0 0 14px}.mission-router-ui .mr-help{margin:4px 0 8px;opacity:.85}
+        .mission-router-ui label{display:block;margin:7px 0}.mission-router-ui select,.mission-router-ui input[type="text"],.mission-router-ui input[type="password"],.mission-router-ui textarea{box-sizing:border-box;width:100%}
+        .mission-router-ui .portals{max-height:180px;overflow:auto;margin:8px 0;padding:4px 6px;border:1px solid rgba(128,128,128,.45)}
+        .mission-router-ui .portals label{margin:3px 0}.mission-router-ui .mr-empty{margin:4px;opacity:.7}
+        .mission-router-ui details{margin:8px 0}.mission-router-ui summary{cursor:pointer;font-weight:bold}
+        .mission-router-ui .mr-inline{display:flex;gap:6px;align-items:center}.mission-router-ui .mr-inline input{width:70px}
+        .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
+        .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
+      </style>
+        <h3>Mission Route Planner <small>v0.11.1</small></h3>
+        <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
+        <section><h4>1. Collect portals</h4>
+          <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
+          <button class="scan">Scan drawn areas</button> <button class="clear">Clear collection</button>
+          <div class="portals"><p class="mr-empty">No portals collected yet.</p></div>
+        </section>
+        <section><h4>2. Configure route</h4>
+          <label>Routing mode <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths</option></select></label>
+          <div class="walking-settings" hidden>
+            <label>openrouteservice API key <input class="key" type="password" autocomplete="off"></label>
+            <p class="mr-help"><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Selected coordinates are sent for routing; review any estimated segments.</p>
+            <label><input class="visit-passing" type="checkbox" checked> Visit portals when within 30 m</label>
+          </div>
+          <label>Start portal <select class="start"><option value="">Automatic</option></select></label>
+          <label>Finish portal <select class="end"><option value="">Automatic</option></select></label>
+          <p class="end-hint" hidden>The route will finish at its start; the finish selection is ignored.</p>
+          <label class="mr-inline">Mission count <input class="count" type="number" min="1" step="1" value="1"></label>
+          <details><summary>Mission and route options</summary>
+            <label><input class="maximize-banner" type="checkbox"> Maximize banner length</label>
+            <p class="banner-hint" role="status" aria-live="polite" hidden></p>
+            <label><input class="shared" type="checkbox"> Share endpoints between missions</label>
+            <label><input class="closed" type="checkbox"> Return to the starting portal</label>
+            <label><input class="backtracking" type="checkbox"> Prefer less backtracking</label>
+          </details>
+        </section>
+        <section><h4>3. Optimize and export</h4>
+          <label>Banner / mission name <input class="name" type="text" value="My mission"></label>
+          <label>Mission description <textarea class="description" rows="3" placeholder="Describe the route for agents"></textarea></label>
+          <div class="mr-actions"><button class="optimize">Optimize route</button><button class="cancel" disabled>Cancel</button><button class="export">Export UMM JSON</button></div>
+          <p class="mr-help"><a href="https://github.com/ec560/ingress-mission-router#review-and-debug-a-route" target="_blank" rel="noopener noreferrer">Route help and troubleshooting</a></p>
+          <div class="legend"></div><p class="status" role="status" aria-live="polite">Draw an area and scan it to begin.</p>
+        </section>`;
       const on = (selector, action) => { ui.querySelector(selector).onclick = async () => {
         if (p.busy) return;
         try { await action(); } catch (e) { p.say(e.message); }
@@ -947,7 +966,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.0'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.1'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
