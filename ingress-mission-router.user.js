@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.7
+// @version      0.12.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -321,7 +321,12 @@
       return rings.some(r => p.inPolygon(point, r));
     };
     p.say = text => { p.ui.querySelector('.status').textContent = text; };
-    p.invalidate = () => { p.route = null; p.walk = null; p.interactionTravel = null; p.backtrackingInfo = ''; p.backtrackingEnabled = false; p.preview.clearLayers(); if (p.ui) p.ui.querySelector('.legend')?.replaceChildren(); };
+    p.invalidate = () => {
+      p.route = null; p.walk = null; p.interactionTravel = null; p.backtrackingInfo = '';
+      p.backtrackingEnabled = false; p.manualOrder = false; p.fixedStartGuid = ''; p.fixedEndGuid = '';
+      p.preview.clearLayers();
+      if (p.ui) { p.ui.querySelector('.legend')?.replaceChildren(); p.renderRouteOrder?.(); }
+    };
     p.scan = () => {
       if (!window.plugin.drawTools?.drawnItems) throw Error('Enable Draw Tools and reload IITC.');
       const areas = [];
@@ -1189,6 +1194,101 @@
             ? 'CAPTURE_PORTAL' : 'HACK_PORTAL', passphrase_params: {question: '', _single_passphrase: ''}}}))
       }))
     });
+    p.routeLockedGuids = () => {
+      const locked = new Set();
+      if (p.fixedStartGuid) locked.add(p.fixedStartGuid);
+      if (p.fixedEndGuid && !p.closed) locked.add(p.fixedEndGuid);
+      if (p.closed && p.route?.length) locked.add(p.route[0].guid);
+      return locked;
+    };
+    p.canMoveRoutePortal = (index, offset) => {
+      if (!p.route || !Number.isInteger(index) || ![-1, 1].includes(offset)) return false;
+      const target = index + offset;
+      if (target < 0 || target >= p.route.length) return false;
+      const locked = p.routeLockedGuids();
+      return !locked.has(p.route[index].guid) && !locked.has(p.route[target].guid);
+    };
+    p.renderRouteOrder = (chunks = null) => {
+      const panel = p.ui?.querySelector('.route-review'), list = p.ui?.querySelector('.route-order-list');
+      if (!panel || !list) return;
+      list.replaceChildren(); panel.hidden = !p.route;
+      if (!p.route) return;
+      if (!chunks) try {
+        chunks = p.split(p.route, p.syncBannerCount(true), p.ui.querySelector('.shared').checked, p.closed);
+      } catch (_) { chunks = []; }
+      const memberships = new Map();
+      chunks.forEach((chunk, mission) => chunk.forEach(portal => {
+        if (!memberships.has(portal.guid)) memberships.set(portal.guid, []);
+        if (!memberships.get(portal.guid).includes(mission)) memberships.get(portal.guid).push(mission);
+      }));
+      const locked = p.routeLockedGuids();
+      p.route.forEach((portal, index) => {
+        const item = document.createElement('li'), row = document.createElement('div'), details = document.createElement('span');
+        const title = document.createElement('strong'), context = document.createElement('small');
+        title.textContent = portal.title; details.className = 'route-portal'; details.append(title, context);
+        const missions = memberships.get(portal.guid) || [];
+        const notes = [missions.length ? `Mission ${missions.map(v => v + 1).join(' / ')}` : 'Mission boundary unavailable'];
+        if (p.closed && index === 0) notes.push('start and finish locked');
+        else if (portal.guid === p.fixedStartGuid) notes.push('start locked');
+        else if (portal.guid === p.fixedEndGuid) notes.push('finish locked');
+        context.textContent = notes.join(' · ');
+        const controls = document.createElement('span'); controls.className = 'route-moves';
+        for (const [offset, text, direction] of [[-1, '↑ Earlier', 'earlier'], [1, '↓ Later', 'later']]) {
+          const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
+          const target = index + offset, canMove = p.canMoveRoutePortal(index, offset);
+          button.disabled = p.busy || !canMove;
+          button.title = canMove ? `Move ${portal.title} ${direction}` : locked.has(portal.guid)
+            ? 'This endpoint is locked.' : target < 0 || target >= p.route.length
+              ? `This portal is already ${direction === 'earlier' ? 'first' : 'last'}.`
+              : 'A locked endpoint must stay in place.';
+          button.setAttribute('aria-label', `Move ${portal.title} ${direction}`);
+          button.onclick = async () => {
+            if (p.busy) return;
+            try { await p.moveRoutePortal(index, offset); } catch (e) { p.say(e.message); }
+          };
+          controls.append(button);
+        }
+        row.className = 'route-order-row'; row.append(details, controls); item.append(row); list.append(item);
+      });
+    };
+    p.setBusy = value => {
+      p.busy = value;
+      if (!p.ui) return;
+      p.ui.querySelectorAll('input,select,button,textarea').forEach(el => { el.disabled = value; });
+      const cancel = p.ui.querySelector('.cancel'); if (cancel) cancel.disabled = !value;
+      if (!value) {
+        const end = p.ui.querySelector('.end'); if (end) end.disabled = p.ui.querySelector('.closed').checked;
+        p.syncBannerCount();
+      }
+      p.renderRouteOrder();
+    };
+    p.moveRoutePortal = async (index, offset) => {
+      if (!p.route) throw Error('Optimize the current selection before editing its order.');
+      if (!p.canMoveRoutePortal(index, offset)) throw Error('That move would change a locked endpoint.');
+      const route = [...p.route], target = index + offset;
+      [route[index], route[target]] = [route[target], route[index]];
+      p.split(route, p.syncBannerCount(true), p.ui.querySelector('.shared').checked, p.closed);
+      const previous = {route: p.route, walk: p.walk, interactionTravel: p.interactionTravel,
+        backtrackingInfo: p.backtrackingInfo, backtrackingEnabled: p.backtrackingEnabled, manualOrder: p.manualOrder};
+      p.controller = new AbortController(); p.setBusy(true);
+      try {
+        const walking = p.ui.querySelector('.mode').value === 'walk';
+        p.say(walking ? 'Recalculating walking paths for the adjusted order…' : 'Updating the adjusted route…');
+        const walked = p.closed ? route.concat([route[0]]) : route;
+        const geometry = walking ? await p.walkGeometry(walked, p.say) : null;
+        p.checkCancel();
+        p.route = route; p.walk = geometry;
+        p.interactionTravel = geometry || p.rangeStraight(route, p.closed);
+        p.backtrackingInfo = ''; p.backtrackingEnabled = false; p.manualOrder = true;
+        p.draw();
+      } catch (error) {
+        Object.assign(p, previous);
+        try { p.draw(); } catch (_) {}
+        throw error;
+      } finally {
+        p.controller = null; p.setBusy(false);
+      }
+    };
     p.draw = () => {
       p.preview.clearLayers();
       const chunks = p.split(p.route, p.syncBannerCount(true), p.ui.querySelector('.shared').checked, p.closed);
@@ -1247,15 +1347,17 @@
       if (p.ui.querySelector('.shared').checked) result.push('shared mission endpoints');
       if (p.walk?.hasEstimates) result.push(`${(p.walk.estimatedDistance / 1000).toFixed(2)} km uses straight-line estimates`);
       if (p.backtrackingEnabled && p.backtrackingInfo) result.push(p.backtrackingInfo.replace(/[.\s]+$/, ''));
+      if (p.manualOrder) result.push('order adjusted manually');
       let summary = result.join(' • ') + '.';
       if (p.walk?.warnings?.length) summary += ` Review: ${p.walk.warnings.join(' ')}`;
+      p.renderRouteOrder(chunks);
       p.say(summary);
       p.preview.addTo(window.map);
     };
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.7', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.12.0', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -1269,8 +1371,15 @@
         .mission-router-ui .mr-inline{display:flex;gap:6px;align-items:center}.mission-router-ui .mr-inline input{width:70px}
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
+        .mission-router-ui .route-review{margin-top:12px;padding-top:10px;border-top:1px solid rgba(128,128,128,.45)}
+        .mission-router-ui .route-review h5{margin:0 0 4px;font-size:1em}.mission-router-ui .route-order-list{max-height:240px;overflow:auto;margin:8px 0;padding-left:2.2em}
+        .mission-router-ui .route-order-list li{padding:6px 2px;border-bottom:1px solid rgba(128,128,128,.25)}
+        .mission-router-ui .route-order-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+        .mission-router-ui .route-portal{min-width:0}.mission-router-ui .route-portal strong{display:block;overflow-wrap:anywhere}.mission-router-ui .route-portal small{display:block;margin-top:2px;opacity:.75}
+        .mission-router-ui .route-moves{display:flex;gap:4px}.mission-router-ui .route-moves button{white-space:nowrap;padding:3px 6px}
+        @media(max-width:420px){.mission-router-ui .route-order-row{grid-template-columns:1fr}.mission-router-ui .route-moves{justify-content:flex-start}}
       </style>
-        <h3>Mission Route Planner <small>v0.11.7</small></h3>
+        <h3>Mission Route Planner <small>v0.12.0</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -1301,6 +1410,10 @@
           <label>Banner / mission name <input class="name" type="text" value="My mission"></label>
           <label>Mission description <textarea class="description" rows="3" placeholder="Describe the route for agents"></textarea></label>
           <div class="mr-actions"><button class="optimize">Optimize route</button><button class="cancel" disabled>Cancel</button><button class="export">Export UMM JSON</button></div>
+          <div class="route-review" hidden><h5>Review portal order</h5>
+            <p class="mr-help">Move a portal earlier or later, then check the updated mission lines on the map. Locked endpoints stay in place.</p>
+            <ol class="route-order-list"></ol>
+          </div>
           <p class="mr-help"><a href="https://github.com/ec560/ingress-mission-router#review-and-debug-a-route" target="_blank" rel="noopener noreferrer">Route help and troubleshooting</a></p>
           <div class="legend"></div><p class="status" role="status" aria-live="polite">Draw an area and scan it to begin.</p>
         </section>`;
@@ -1344,8 +1457,7 @@
         const points = [...p.pool.values()].filter(v => !p.excluded.has(v.guid));
         p.split(points, p.syncBannerCount(true), ui.querySelector('.shared').checked);
         p.controller = new AbortController();
-        p.busy = true; ui.querySelectorAll('input,select,button,textarea').forEach(el => el.disabled = true);
-        ui.querySelector('.cancel').disabled = false;
+        p.setBusy(true);
         p.say('Optimizing…');
         try {
           const walking = ui.querySelector('.mode').value === 'walk';
@@ -1388,14 +1500,12 @@
             route = refined.route; geometry = refined.geometry;
             backtrackingInfo = `${backtrackingInfo} ${refined.info}`.trim();
           }
-          p.checkCancel(); p.route = route; p.walk = geometry; p.interactionTravel = geometry || p.rangeStraight(route, closed); p.closed = closed; p.backtrackingEnabled = backtracking || visitPassing; p.backtrackingInfo = backtrackingInfo; p.draw();
+          p.checkCancel(); p.route = route; p.walk = geometry; p.interactionTravel = geometry || p.rangeStraight(route, closed);
+          p.closed = closed; p.fixedStartGuid = fixed; p.fixedEndGuid = endGuid; p.manualOrder = false;
+          p.backtrackingEnabled = backtracking || visitPassing; p.backtrackingInfo = backtrackingInfo; p.draw();
         } catch (e) { p.invalidate(); throw e; }
         finally {
-          p.busy = false; p.controller = null;
-          ui.querySelectorAll('input,select,button,textarea').forEach(el => el.disabled = false);
-          ui.querySelector('.cancel').disabled = true;
-          ui.querySelector('.end').disabled = ui.querySelector('.closed').checked;
-          p.syncBannerCount();
+          p.controller = null; p.setBusy(false);
         }
       });
       on('.export', () => {
@@ -1417,7 +1527,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.7'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.12.0'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
