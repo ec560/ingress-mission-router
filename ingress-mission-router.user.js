@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.2
+// @version      0.11.3
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -618,25 +618,6 @@
       }
       return winner;
     };
-    // Count repeated mapped edges (coordinates rounded to ~0.1m).
-    // This detects retracing, not crossings; differently segmented geometry
-    // and parallel paths may prevent matches. No global optimality claim.
-    p.retracing = geometry => {
-      const seen = new Map(); let repeated = 0, reversed = 0;
-      const vertex = ll => ll.map(v => Number(v).toFixed(6)).join(',');
-      for (const leg of geometry.legs.filter(leg => !leg.estimated)) for (let i = 1; i < leg.line.length; i++) {
-        const a = leg.line[i - 1], b = leg.line[i], ak = vertex(a), bk = vertex(b);
-        if (ak === bk) continue;
-        const forward = ak < bk, key = forward ? ak + '|' + bk : bk + '|' + ak;
-        const meters = p.distance({lat: a[0], lng: a[1]}, {lat: b[0], lng: b[1]});
-        if (seen.has(key)) {
-          repeated += meters;
-          if (seen.get(key) !== forward) reversed += meters;
-        }
-        seen.set(key, forward);
-      }
-      return {repeated, reversed, score: geometry.distance + 2 * repeated + 2 * reversed};
-    };
     p.turnPenalty = (route, closed) => {
       let penalty = 0;
       for (let i = closed ? 0 : 1; i < (closed ? route.length : route.length - 1); i++) {
@@ -762,9 +743,13 @@
     p.backtrackCandidates = (route, fixed, closed, matrix, points, limit = 6, endGuid = '') => {
       const index = new Map(points.map((v, i) => [v.guid, i]));
       const distance = (a, b) => matrix ? matrix[index.get(a.guid)][index.get(b.guid)] : p.distance(a, b);
-      const score = r => r.slice(1).reduce((sum, v, i) => sum + distance(r[i], v), 0) +
-        (closed ? distance(r[r.length - 1], r[0]) : 0) + 2 * p.turnPenalty(r, closed);
-      const baseline = score(route), candidates = [], signatures = new Set([route.map(v => v.guid).join('|')]);
+      const metrics = r => {
+        const travel = r.slice(1).reduce((sum, v, i) => sum + distance(r[i], v), 0) +
+          (closed ? distance(r[r.length - 1], r[0]) : 0);
+        const penalty = p.turnPenalty(r, closed);
+        return {distance: travel, penalty, score: travel + 2 * penalty};
+      };
+      const baselineMetrics = metrics(route), candidates = [], signatures = new Set([route.map(v => v.guid).join('|')]);
       const first = fixed || closed ? 1 : 0, n = route.length;
       // Bound local search for large portal sets; fixed starts never move.
       const positions = [...new Set(Array.from({length: Math.min(n - first, 40)}, (_, i) =>
@@ -773,8 +758,7 @@
         if (endGuid && r[r.length - 1].guid !== endGuid) return;
         const signature = r.map(v => v.guid).join('|');
         if (signatures.has(signature)) return; signatures.add(signature);
-        const value = score(r);
-        candidates.push({route: r, score: value}); candidates.sort((a, b) => a.score - b.score);
+        candidates.push({route: r, ...metrics(r)}); candidates.sort((a, b) => a.score - b.score);
         if (candidates.length > limit) candidates.pop();
       };
       for (const i of positions) for (const j of positions) if (i < j) {
@@ -782,38 +766,29 @@
         const moved = route.slice(), portal = moved.splice(i, 1)[0]; moved.splice(j, 0, portal); consider(moved);
         const earlier = route.slice(), laterPortal = earlier.splice(j, 1)[0]; earlier.splice(i, 0, laterPortal); consider(earlier);
       }
-      return {baseline, candidates};
+      return {baseline: baselineMetrics.score, baselineDistance: baselineMetrics.distance,
+        baselinePenalty: baselineMetrics.penalty, candidates};
     };
-    p.reduceBacktracking = async (route, fixed, closed, matrix, points, geometry, progress, endGuid = '') => {
-      if (!geometry) {
-        let best = route;
-        for (let pass = 0; pass < 8; pass++) {
-          const search = p.backtrackCandidates(best, fixed, closed, matrix, points, 1, endGuid);
-          if (!search.candidates.length || search.candidates[0].score >= search.baseline - 1e-6) break;
-          best = search.candidates[0].route;
-          progress(`Reducing sharp reversals ${pass + 1}/8…`); await p.pause(0);
-        }
-        return {route: best, geometry: null, info: 'Sharp-reversal preference applied (straight-line estimate).'};
+    p.reduceBacktracking = async (route, fixed, closed, matrix, points, progress, endGuid = '', pedestrian = false) => {
+      // Compare portal orders from the distance matrix already in memory. The
+      // selected order receives its single directions request afterward.
+      let search = p.backtrackCandidates(route, fixed, closed, matrix, points, 6, endGuid);
+      const original = search;
+      const maximumDistance = original.baselineDistance * 1.2 + 0.1;
+      let best = route;
+      for (let pass = 0; pass < 8; pass++) {
+        const candidate = search.candidates.find(item =>
+          item.distance <= maximumDistance && item.penalty < search.baselinePenalty - 1e-6 &&
+          item.score < search.baseline - 1e-6);
+        if (!candidate) break;
+        best = candidate.route;
+        progress(`Comparing backtracking alternatives locally ${pass + 1}/8…`);
+        await p.pause(0);
+        search = p.backtrackCandidates(best, fixed, closed, matrix, points, 6, endGuid);
       }
-      const original = p.retracing(geometry);
-      let best = {route, geometry, score: original.score, repeated: original.repeated};
-      // Geometry is fetched only for a small shortlist, rather than every pair.
-      // Even if no better candidate is found, preserve the original route.
-      if (original.repeated > 1) {
-        const search = p.backtrackCandidates(route, fixed, closed, matrix, points, 5, endGuid);
-        for (let i = 0; i < search.candidates.length; i++) {
-          const candidate = search.candidates[i].route;
-          progress(`Checking backtracking alternative ${i + 1}/${search.candidates.length}…`);
-          const walked = closed ? candidate.concat([candidate[0]]) : candidate;
-          const alternative = await p.walkGeometry(walked, message => progress(`Alternative ${i + 1}: ${message}`));
-          const stats = p.retracing(alternative);
-          if (alternative.distance <= geometry.distance * 1.2 + 0.1 && stats.score < best.score - 1e-6 && stats.repeated <= best.repeated + 0.1)
-            best = {route: candidate, geometry: alternative, score: stats.score, repeated: stats.repeated};
-          await p.pause(0);
-        }
-      }
-      return {route: best.route, geometry: best.geometry,
-        info: `Matched retraced paths: ${Math.round(original.repeated)}m → ${Math.round(best.repeated)}m. Backtracking search is approximate.`};
+      const finalPenalty = p.turnPenalty(best, closed);
+      return {route: best,
+        info: `${pedestrian ? 'Pedestrian backtracking alternatives compared' : 'Sharp-reversal preference applied'} locally; estimated reversal penalty ${Math.round(original.baselinePenalty)}m → ${Math.round(finalPenalty)}m.`};
     };
     p.maxBannerLength = (portalCount, sharedEndpoints = false) => {
       // Shared boundaries reuse one portal: M missions need 5M + 1
@@ -929,7 +904,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.2', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.3', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -944,7 +919,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.2</small></h3>
+        <h3>Mission Route Planner <small>v0.11.3</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -1049,14 +1024,14 @@
               if (bestRoute === route) break; route = bestRoute; await p.pause(0);
             }
           }
-          const walkingRoute = closed ? route.concat([route[0]]) : route;
-          let geometry = walking ? await p.walkGeometry(walkingRoute, p.say) : null;
           const backtracking = ui.querySelector('.backtracking').checked;
           let backtrackingInfo = '';
           if (backtracking) {
-            const refined = await p.reduceBacktracking(route, fixed, closed, matrix, points, geometry, p.say, endGuid);
-            route = refined.route; geometry = refined.geometry; backtrackingInfo = refined.info;
+            const refined = await p.reduceBacktracking(route, fixed, closed, matrix, points, p.say, endGuid, walking);
+            route = refined.route; backtrackingInfo = refined.info;
           }
+          const walkingRoute = closed ? route.concat([route[0]]) : route;
+          let geometry = walking ? await p.walkGeometry(walkingRoute, p.say) : null;
           if (visitPassing) {
             const refined = await p.visitAsYouPass(route, geometry, closed, endGuid, p.say);
             route = refined.route; geometry = refined.geometry;
@@ -1091,7 +1066,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.2'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.3'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
