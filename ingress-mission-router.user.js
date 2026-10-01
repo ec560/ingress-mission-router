@@ -1,21 +1,16 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.12.0
+// @version      0.11.2
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
-// @grant        GM_deleteValue
-// @grant        GM_getValue
-// @grant        GM_registerMenuCommand
-// @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 (function () {
   'use strict';
   const ORS_BASE = 'https://api.heigit.org/openrouteservice/v2/';
-  const ORS_KEY = 'openrouteservice-api-key';
   const ORS_ENDPOINTS = new Set([
     'snap/foot-walking/json',
     'matrix/foot-walking',
@@ -28,22 +23,18 @@
   const responseEvent = `mission-router:${random}:response`;
   const pendingRequests = new Map();
   const promptForKey = globalThis.prompt.bind(globalThis);
-  const readKey = () => String(GM_getValue(ORS_KEY, '') || '').trim();
+  let orsKey = '';
+  const readKey = () => orsKey;
   const keyState = () => ({hasKey: Boolean(readKey())});
   const reply = (id, payload) => document.dispatchEvent(new CustomEvent(responseEvent, {
     detail: JSON.stringify({id, ...payload})
   }));
   const configureKey = () => {
-    const value = promptForKey('Paste your openrouteservice API key. It will be stored by your userscript manager and will not be added to the IITC page. Enter a blank value to remove the saved key.');
+    const value = promptForKey('Paste your openrouteservice API key. It will be kept outside the IITC page until you reload it. Enter a blank value to remove the key.');
     if (value === null) return {changed: false, ...keyState()};
-    const key = value.trim();
-    if (key) GM_setValue(ORS_KEY, key); else GM_deleteValue(ORS_KEY);
+    orsKey = value.trim();
     return {changed: true, ...keyState()};
   };
-  const removeKey = () => { GM_deleteValue(ORS_KEY); return {changed: true, hasKey: false}; };
-
-  GM_registerMenuCommand('Set or replace ORS API key', configureKey);
-  GM_registerMenuCommand('Remove saved ORS API key', removeKey);
 
   document.addEventListener(requestEvent, event => {
     let message;
@@ -142,8 +133,8 @@
       p.hasApiKey = Boolean(hasKey);
       const status = p.ui?.querySelector('.key-status');
       if (status) status.textContent = p.hasApiKey
-        ? 'API key saved securely by the userscript manager.'
-        : 'No API key saved.';
+        ? 'API key set for this page session.'
+        : 'No API key set.';
     };
     p.refreshKeyState = async () => {
       const state = await p.bridge('key-status'); p.showKeyState(state.hasKey); return state.hasKey;
@@ -938,7 +929,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.12.0', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.2', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -953,7 +944,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.12.0</small></h3>
+        <h3>Mission Route Planner <small>v0.11.2</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -963,9 +954,9 @@
         <section><h4>2. Configure route</h4>
           <label>Routing mode <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths</option></select></label>
           <div class="walking-settings" hidden>
-            <p class="key-status">${bridge.hasKey ? 'API key saved securely by the userscript manager.' : 'No API key saved.'}</p>
+            <p class="key-status">${bridge.hasKey ? 'API key set for this page session.' : 'No API key set.'}</p>
             <div class="mr-actions"><button class="set-key" type="button">Manage API key</button></div>
-            <p class="mr-help"><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. The key stays outside the IITC page; enter a blank value to remove it.</p>
+            <p class="mr-help"><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. The key stays outside the IITC page and is cleared when you reload it.</p>
             <label><input class="visit-passing" type="checkbox" checked> Visit portals when within 30 m</label>
           </div>
           <label>Start portal <select class="start"><option value="">Automatic</option></select></label>
@@ -1001,7 +992,7 @@
       };
       on('.set-key', async () => {
         const state = await p.bridge('configure-key'); p.showKeyState(state.hasKey);
-        p.say(state.changed ? (state.hasKey ? 'API key saved by the userscript manager.' : 'Saved API key removed.') : 'API key unchanged.');
+        p.say(state.changed ? (state.hasKey ? 'API key set for this page session.' : 'API key removed.') : 'API key unchanged.');
       });
       on('.scan', p.scan);
       on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.walkAccess = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
@@ -1100,7 +1091,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.12.0'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.2'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
