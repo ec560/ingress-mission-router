@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.5
+// @version      0.11.6
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -280,7 +280,7 @@
       await p.pruneWalkingCache();
     };
     p.clearWalkingCache = async () => {
-      p.walkCache = null; p.walkDistanceCache = null; p.matrixProgressCache = null;
+      p.walkCache = null; p.walkDistanceCache = null;
       p.walkAccess = null; p.walkPathCache.clear();
       const db = await p.openWalkingCache();
       if (!db) return;
@@ -448,6 +448,38 @@
     };
     p.saveDistanceCache = async () => p.writeWalkingCache('distances', p.distanceCacheSignature,
       p.serializeDistanceCache(p.walkDistanceCache));
+    p.planMissingDistances = (items, cache, limit = 50) => {
+      const remaining = new Map(); let missing = 0;
+      for (const source of items) {
+        const targets = new Set();
+        for (const destination of items)
+          if (cache.distances.get(source.fingerprint)?.get(destination.fingerprint) === undefined) {
+            targets.add(destination.fingerprint); missing++;
+          }
+        if (targets.size) remaining.set(source.fingerprint, targets);
+      }
+      const requests = [];
+      while (remaining.size) {
+        const seedTargets = remaining.entries().next().value[1];
+        const destinations = items.filter(item => seedTargets.has(item.fingerprint)).slice(0, limit);
+        const sources = [];
+        for (const item of items) {
+          const targets = remaining.get(item.fingerprint);
+          if (targets && destinations.every(destination => targets.has(destination.fingerprint))) {
+            sources.push(item);
+            if (sources.length === limit) break;
+          }
+        }
+        requests.push({sources, destinations});
+        for (const source of sources) {
+          const targets = remaining.get(source.fingerprint);
+          destinations.forEach(destination => targets.delete(destination.fingerprint));
+          if (!targets.size) remaining.delete(source.fingerprint);
+        }
+      }
+      const total = items.length * items.length;
+      return {total, hits: total - missing, missing, requests};
+    };
     p.walkMatrix = async (points, progress) => {
       if (points.length > 300) throw Error('Pedestrian mode currently supports up to 300 selected portals.');
       const signature = p.cacheSignature(points);
@@ -486,29 +518,24 @@
       const matrix = points.map(a => Float64Array.from(points, b => p.distance(a, b)));
       const onPath = points.map((portal, index) => ({portal, index, fingerprint: fingerprints[index]}))
         .filter(v => !p.walkAccess.get(v.portal.guid).offPath);
-      let complete = true;
       for (const source of onPath) for (const destination of onPath) {
         const value = cache.distances.get(source.fingerprint)?.get(destination.fingerprint);
-        if (value === undefined) complete = false; else matrix[source.index][destination.index] = value;
+        if (value !== undefined) matrix[source.index][destination.index] = value;
       }
-      if (complete) {
+      const plan = p.planMissingDistances(onPath, cache);
+      if (!plan.missing) {
         p.walkCache = {signature, matrix, access: p.walkAccess};
-        progress('Reusing saved walking distances…'); return matrix;
+        progress(`Walking distances: ${plan.hits}/${plan.total} cached; no requests needed.`); return matrix;
       }
       await requireKey();
-      if (p.matrixProgressCache?.signature !== signature)
-        p.matrixProgressCache = {signature, completed: new Set()};
-      const partial = p.matrixProgressCache;
-      const blocks = Math.ceil(onPath.length / 50); let completed = 0;
+      progress(`Walking distances: ${plan.hits}/${plan.total} cached; ${plan.missing} missing in ${plan.requests.length} request${plan.requests.length === 1 ? '' : 's'}.`);
       // Only reachable portals go to the matrix service. All other pairs keep
       // their straight-line estimates instead of failing the complete matrix.
-      for (let a = 0; a < onPath.length; a += 50) for (let b = 0; b < onPath.length; b += 50) {
+      for (let requestIndex = 0; requestIndex < plan.requests.length; requestIndex++) {
         p.checkCancel();
-        const block = a + ':' + b;
-        if (partial.completed.has(block)) { completed++; continue; }
-        const sources = onPath.slice(a, a + 50), destinations = onPath.slice(b, b + 50);
+        const {sources, destinations} = plan.requests[requestIndex];
         const locations = sources.concat(destinations).map(v => p.walkAccess.get(v.portal.guid).location);
-        progress(`Fetching walking distances ${++completed}/${blocks * blocks}…`);
+        progress(`Fetching missing walking distances ${requestIndex + 1}/${plan.requests.length} (${plan.hits}/${plan.total} cached; ${sources.length * destinations.length} pairs)…`);
         const data = await p.request('matrix/foot-walking', {locations,
           sources: sources.map((_, i) => String(i)),
           destinations: destinations.map((_, i) => String(sources.length + i)),
@@ -523,19 +550,24 @@
           });
         }
         if (!Array.isArray(data.distances) || data.distances.length !== sources.length) throw Error('Invalid walking distance response.');
+        const updates = [];
         for (let i = 0; i < sources.length; i++) for (let j = 0; j < destinations.length; j++) {
           const value = data.distances[i]?.[j];
           if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
             throw Error(`No walking connection: ${sources[i].portal.title} → ${destinations[j].portal.title}. Exclude disconnected portals and retry.`);
-          matrix[sources[i].index][destinations[j].index] = value;
-          if (!cache.distances.has(sources[i].fingerprint)) cache.distances.set(sources[i].fingerprint, new Map());
-          cache.distances.get(sources[i].fingerprint).set(destinations[j].fingerprint, value);
+          updates.push({source: sources[i], destination: destinations[j], value});
         }
-        partial.completed.add(block);
+        // Validate the whole response before publishing any values, then save
+        // each successful request so later cancellation or failure loses none.
+        for (const {source, destination, value} of updates) {
+          matrix[source.index][destination.index] = value;
+          if (!cache.distances.has(source.fingerprint)) cache.distances.set(source.fingerprint, new Map());
+          cache.distances.get(source.fingerprint).set(destination.fingerprint, value);
+        }
+        await p.saveDistanceCache();
       }
       p.checkCancel();
-      p.walkCache = {signature, matrix, access: p.walkAccess}; p.matrixProgressCache = null;
-      await p.saveDistanceCache();
+      p.walkCache = {signature, matrix, access: p.walkAccess};
       return matrix;
     };
     p.pathPosition = portal => {
@@ -1152,7 +1184,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.5', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.6', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -1167,7 +1199,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.5</small></h3>
+        <h3>Mission Route Planner <small>v0.11.6</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -1314,7 +1346,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.5'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.6'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
