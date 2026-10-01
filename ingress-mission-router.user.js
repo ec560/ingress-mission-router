@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.3
+// @version      0.11.4
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -829,13 +829,14 @@
     p.exportState = (route, count, name, description, sharedEndpoints = false, closed = false) => ({
       missionSetName: name, missionSetDescription: description, currentMission: 0,
       plannedBannerLength: count, titleFormat: 'T NN-M', fileFormatVersion: 2,
-      missions: p.split(route, count, sharedEndpoints, closed).map((chunk, i) => ({
+      missions: p.split(route, count, sharedEndpoints, closed).map((chunk, i, chunks) => ({
         missionTitle: `${name} ${String(i + 1).padStart(String(count).length, '0')}-${count}`,
         missionDescription: description,
-        portals: chunk.map(v => ({description: '', guid: v.guid, imageUrl: v.imageUrl,
+        portals: chunk.map((v, position) => ({description: '', guid: v.guid, imageUrl: v.imageUrl,
           isOrnamented: false, isStartPoint: false,
           location: {latitude: v.lat, longitude: v.lng}, title: v.title, type: 'PORTAL',
-          objective: {type: 'HACK_PORTAL', passphrase_params: {question: '', _single_passphrase: ''}}}))
+          objective: {type: sharedEndpoints && i < chunks.length - 1 && position === chunk.length - 1
+            ? 'CAPTURE_PORTAL' : 'HACK_PORTAL', passphrase_params: {question: '', _single_passphrase: ''}}}))
       }))
     });
     p.draw = () => {
@@ -904,7 +905,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.3', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.4', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -919,7 +920,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.3</small></h3>
+        <h3>Mission Route Planner <small>v0.11.4</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -1066,7 +1067,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.3'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.4'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
