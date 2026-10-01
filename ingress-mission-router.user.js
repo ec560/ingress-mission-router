@@ -1,18 +1,153 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.1
+// @version      0.12.0
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
-// @grant        none
+// @connect      api.heigit.org
+// @grant        GM_deleteValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 (function () {
   'use strict';
-  function wrapper() {
+  const ORS_BASE = 'https://api.heigit.org/openrouteservice/v2/';
+  const ORS_KEY = 'openrouteservice-api-key';
+  const ORS_ENDPOINTS = new Set([
+    'snap/foot-walking/json',
+    'matrix/foot-walking',
+    'directions/foot-walking/geojson'
+  ]);
+  const random = typeof globalThis.crypto?.getRandomValues === 'function'
+    ? Array.from(globalThis.crypto.getRandomValues(new Uint32Array(4)), value => value.toString(36)).join('-')
+    : Math.random().toString(36).slice(2);
+  const requestEvent = `mission-router:${random}:request`;
+  const responseEvent = `mission-router:${random}:response`;
+  const pendingRequests = new Map();
+  const promptForKey = globalThis.prompt.bind(globalThis);
+  const readKey = () => String(GM_getValue(ORS_KEY, '') || '').trim();
+  const keyState = () => ({hasKey: Boolean(readKey())});
+  const reply = (id, payload) => document.dispatchEvent(new CustomEvent(responseEvent, {
+    detail: JSON.stringify({id, ...payload})
+  }));
+  const configureKey = () => {
+    const value = promptForKey('Paste your openrouteservice API key. It will be stored by your userscript manager and will not be added to the IITC page. Enter a blank value to remove the saved key.');
+    if (value === null) return {changed: false, ...keyState()};
+    const key = value.trim();
+    if (key) GM_setValue(ORS_KEY, key); else GM_deleteValue(ORS_KEY);
+    return {changed: true, ...keyState()};
+  };
+  const removeKey = () => { GM_deleteValue(ORS_KEY); return {changed: true, hasKey: false}; };
+
+  GM_registerMenuCommand('Set or replace ORS API key', configureKey);
+  GM_registerMenuCommand('Remove saved ORS API key', removeKey);
+
+  document.addEventListener(requestEvent, event => {
+    let message;
+    try { message = JSON.parse(event.detail); } catch (_) { return; }
+    if (!message || typeof message.id !== 'string' || typeof message.action !== 'string') return;
+    const {id, action} = message;
+    if (action === 'cancel') {
+      const request = pendingRequests.get(message.target);
+      if (request) { pendingRequests.delete(message.target); request.abort(); }
+      return;
+    }
+    if (action === 'key-status') { reply(id, {ok: true, result: keyState()}); return; }
+    if (action === 'configure-key') { reply(id, {ok: true, result: configureKey()}); return; }
+    if (action !== 'ors-request') { reply(id, {ok: false, error: 'unsupported', message: 'Unsupported userscript bridge action.'}); return; }
+
+    const endpoint = message.payload?.endpoint;
+    if (!ORS_ENDPOINTS.has(endpoint)) {
+      reply(id, {ok: false, error: 'blocked-endpoint', message: 'Blocked an unsupported walking-service endpoint.'});
+      return;
+    }
+    const key = readKey();
+    if (!key) {
+      reply(id, {ok: false, error: 'missing-key', message: 'No openrouteservice API key is saved.'});
+      return;
+    }
+    let settled = false, timer;
+    const finish = payload => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); pendingRequests.delete(id); reply(id, payload);
+    };
+    try {
+      const request = GM_xmlhttpRequest({
+        method: 'POST', url: ORS_BASE + endpoint,
+        headers: {'Content-Type': 'application/json', Authorization: key},
+        data: JSON.stringify(message.payload?.body ?? {}), anonymous: true, timeout: 60000,
+        onload: response => {
+          const text = String(response.responseText || '').split(key).join('[redacted]');
+          let body = null;
+          if (text) try { body = JSON.parse(text); } catch (_) {}
+          finish({ok: true, result: {status: response.status, body}});
+        },
+        onerror: () => finish({ok: false, error: 'network', message: 'The walking-service request failed.'}),
+        ontimeout: () => finish({ok: false, error: 'timeout', message: 'The walking-service request timed out.'}),
+        onabort: () => finish({ok: false, error: 'cancelled', message: 'The walking-service request was cancelled.'})
+      });
+      if (!settled) {
+        pendingRequests.set(id, request);
+        timer = setTimeout(() => {
+          finish({ok: false, error: 'timeout', message: 'The walking-service request timed out.'});
+          request.abort();
+        }, 60000);
+      }
+    } catch (_) {
+      finish({ok: false, error: 'network', message: 'The userscript manager could not start the walking-service request.'});
+    }
+  });
+
+  function wrapper(bridge) {
     if (typeof window.plugin !== 'function') window.plugin = function () {};
     if (window.plugin.missionRouter) return;
     const p = window.plugin.missionRouter = {};
+    const bridgePending = new Map();
+    let bridgeSequence = 0;
+    document.addEventListener(bridge.responseEvent, event => {
+      let message;
+      try { message = JSON.parse(event.detail); } catch (_) { return; }
+      const pending = bridgePending.get(message?.id);
+      if (!pending) return;
+      bridgePending.delete(message.id); pending.cleanup();
+      if (message.ok) pending.resolve(message.result);
+      else {
+        const error = Error(message.message || 'Userscript bridge request failed.');
+        error.code = message.error; pending.reject(error);
+      }
+    });
+    p.bridge = (action, payload = {}, signal) => new Promise((resolve, reject) => {
+      const id = `${Date.now().toString(36)}-${++bridgeSequence}`;
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      const abort = () => {
+        if (!bridgePending.delete(id)) return;
+        cleanup();
+        document.dispatchEvent(new CustomEvent(bridge.requestEvent, {
+          detail: JSON.stringify({id: `${id}-cancel`, action: 'cancel', target: id})
+        }));
+        const error = Error('Userscript bridge request cancelled.'); error.name = 'AbortError'; reject(error);
+      };
+      bridgePending.set(id, {resolve, reject, cleanup});
+      signal?.addEventListener('abort', abort, {once: true});
+      if (signal?.aborted) { abort(); return; }
+      document.dispatchEvent(new CustomEvent(bridge.requestEvent, {
+        detail: JSON.stringify({id, action, payload})
+      }));
+    });
+    p.hasApiKey = Boolean(bridge.hasKey);
+    p.showKeyState = hasKey => {
+      p.hasApiKey = Boolean(hasKey);
+      const status = p.ui?.querySelector('.key-status');
+      if (status) status.textContent = p.hasApiKey
+        ? 'API key saved securely by the userscript manager.'
+        : 'No API key saved.';
+    };
+    p.refreshKeyState = async () => {
+      const state = await p.bridge('key-status'); p.showKeyState(state.hasKey); return state.hasKey;
+    };
     p.pool = new Map();
     p.excluded = new Set();
     p.route = null;
@@ -96,27 +231,16 @@
     };
     p.checkCancel = () => { if (p.controller?.signal.aborted) throw Error('Calculation cancelled.'); };
     p.pause = async ms => { await new Promise(resolve => setTimeout(resolve, ms)); p.checkCancel(); };
-    p.request = async (endpoint, body, key) => {
+    p.request = async (endpoint, body) => {
       p.checkCancel();
       // Conservative spacing across both endpoints, including repeated runs.
       await p.pause(Math.max(0, 3100 - (Date.now() - (p.lastRequest || 0))));
       p.lastRequest = Date.now();
-      const controller = new AbortController();
-      const cancel = () => controller.abort();
-      p.controller?.signal.addEventListener('abort', cancel, {once: true});
-      const timer = setTimeout(cancel, 60000);
       try {
-        const response = await fetch('https://api.heigit.org/openrouteservice/v2/' + endpoint, {
-          method: 'POST', headers: {'Content-Type': 'application/json', Authorization: key},
-          body: JSON.stringify(body), signal: controller.signal, credentials: 'omit'
-        });
-        if (!response.ok) {
+        const response = await p.bridge('ors-request', {endpoint, body}, p.controller?.signal);
+        if (response.status < 200 || response.status >= 300) {
           if (response.status === 403) {
-            let data;
-            try { data = await response.json(); } catch (e) {
-              // A missing/non-JSON error body must not hide the HTTP status.
-              if (controller.signal.aborted) throw e;
-            }
+            const data = response.body;
             const detail = typeof data?.error === 'string' ? data.error : data?.error?.message || data?.message;
             const message = typeof detail === 'string' ? detail.trim() : '';
             throw Error('Walking service access denied (403). Check your API key and account access to this API.' +
@@ -128,18 +252,17 @@
             404: 'No walking route found for these portals.'};
           throw Error(errors[response.status] || `Walking service error (${response.status}). Try again later.`);
         }
-        return await response.json();
+        return response.body;
       } catch (e) {
         p.checkCancel();
-        if (e.name === 'AbortError') throw Error('Walking request timed out. Try again.');
-        if (e instanceof TypeError) throw Error('Cannot reach the walking service. Check your connection and browser cross-origin restrictions.');
+        if (e.code === 'missing-key') throw Error('Set an openrouteservice API key before using pedestrian routing.');
+        if (e.code === 'timeout') throw Error('Walking request timed out. Try again.');
+        if (e.code === 'network') throw Error('Cannot reach the walking service. Check your connection and userscript-manager permissions.');
         throw e;
-      } finally {
-        clearTimeout(timer); p.controller?.signal.removeEventListener('abort', cancel);
       }
     };
-    p.walkMatrix = async (points, key, progress) => {
-      if (!key) throw Error('Enter an openrouteservice API key for pedestrian routing.');
+    p.walkMatrix = async (points, progress) => {
+      if (!await p.refreshKeyState()) throw Error('Set an openrouteservice API key before using pedestrian routing.');
       if (points.length > 300) throw Error('Pedestrian mode currently supports up to 300 selected portals.');
       const signature = JSON.stringify(points.map(v => [v.guid, v.lng, v.lat]));
       if (p.walkCache?.signature === signature) { p.walkAccess = p.walkCache.access; return p.walkCache.matrix; }
@@ -153,7 +276,7 @@
         progress('Checking for mapped walking paths within 40m of portals…');
         const data = await p.request('snap/foot-walking/json', {
           locations: points.map(v => [v.lng, v.lat]), radius: 40
-        }, key);
+        });
         if (!Array.isArray(data.locations) || data.locations.length !== n)
           throw Error('Walking service returned incomplete path proximity information.');
         const access = new Map();
@@ -184,7 +307,7 @@
         const data = await p.request('matrix/foot-walking', {locations,
           sources: sources.map((_, i) => String(i)),
           destinations: destinations.map((_, i) => String(sources.length + i)),
-          metrics: ['distance'], units: 'm'}, key);
+          metrics: ['distance'], units: 'm'});
         for (const [items, snapped] of [[sources, data.sources], [destinations, data.destinations]]) {
           if (!Array.isArray(snapped) || snapped.length !== items.length) throw Error('Walking service omitted portal snapping information.');
           items.forEach(({portal}, i) => {
@@ -228,9 +351,9 @@
         return {line: [a, b], distance, duration: distance / 1.4, estimated: true};
       });
     };
-    p.walkGeometry = async (route, key, progress) => {
+    p.walkGeometry = async (route, progress) => {
       const offPath = portal => p.walkAccess?.get(portal.guid)?.offPath;
-      if (!route.some(offPath)) return p.mappedWalkGeometry(route, key, progress);
+      if (!route.some(offPath)) return p.mappedWalkGeometry(route, progress);
       const legs = [], warnings = [];
       for (const portal of new Map(route.filter(offPath).map(v => [v.guid, v])).values()) {
         const distance = p.walkAccess.get(portal.guid).distance;
@@ -245,13 +368,13 @@
         } else {
           let end = i + 1;
           while (end + 1 < route.length && !offPath(route[end + 1])) end++;
-          const mapped = await p.mappedWalkGeometry(route.slice(i, end + 1), key, progress);
+          const mapped = await p.mappedWalkGeometry(route.slice(i, end + 1), progress);
           legs.push(...mapped.legs); warnings.push(...(mapped.warnings || [])); i = end;
         }
       }
       return p.summarizeWalk(p.joinEstimatedLegs(legs, route[0].guid === route.at(-1).guid), warnings);
     };
-    p.mappedWalkGeometry = async (route, key, progress) => {
+    p.mappedWalkGeometry = async (route, progress) => {
       const legs = [];
       // Overlapping chunks preserve the link between missions and API batches.
       for (let offset = 0; offset < route.length - 1; offset += 49) {
@@ -260,7 +383,7 @@
         const data = await p.request('directions/foot-walking/geojson', {
           coordinates: chunk.map(p.pathPosition), preference: 'recommended',
           radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
-        }, key);
+        });
         const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
         const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
         if (feature?.geometry?.type !== 'LineString' || !Array.isArray(coordinates) ||
@@ -670,7 +793,7 @@
       }
       return {baseline, candidates};
     };
-    p.reduceBacktracking = async (route, fixed, closed, matrix, points, geometry, key, progress, endGuid = '') => {
+    p.reduceBacktracking = async (route, fixed, closed, matrix, points, geometry, progress, endGuid = '') => {
       if (!geometry) {
         let best = route;
         for (let pass = 0; pass < 8; pass++) {
@@ -691,7 +814,7 @@
           const candidate = search.candidates[i].route;
           progress(`Checking backtracking alternative ${i + 1}/${search.candidates.length}…`);
           const walked = closed ? candidate.concat([candidate[0]]) : candidate;
-          const alternative = await p.walkGeometry(walked, key, message => progress(`Alternative ${i + 1}: ${message}`));
+          const alternative = await p.walkGeometry(walked, message => progress(`Alternative ${i + 1}: ${message}`));
           const stats = p.retracing(alternative);
           if (alternative.distance <= geometry.distance * 1.2 + 0.1 && stats.score < best.score - 1e-6 && stats.repeated <= best.repeated + 0.1)
             best = {route: candidate, geometry: alternative, score: stats.score, repeated: stats.repeated};
@@ -813,13 +936,16 @@
       p.preview.addTo(window.map);
     };
     p.open = () => {
-      if (p.ui) { window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.1', html: p.ui, width: 440}); return; }
+      if (p.ui) {
+        p.refreshKeyState().catch(e => p.say(e.message));
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.12.0', html: p.ui, width: 440}); return;
+      }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
       ui.innerHTML = `<style>
         .mission-router-ui h3,.mission-router-ui h4{margin:0 0 6px}.mission-router-ui h3 small{font-weight:normal;opacity:.7}
         .mission-router-ui section{margin:0 0 14px}.mission-router-ui .mr-help{margin:4px 0 8px;opacity:.85}
-        .mission-router-ui label{display:block;margin:7px 0}.mission-router-ui select,.mission-router-ui input[type="text"],.mission-router-ui input[type="password"],.mission-router-ui textarea{box-sizing:border-box;width:100%}
+        .mission-router-ui label{display:block;margin:7px 0}.mission-router-ui select,.mission-router-ui input[type="text"],.mission-router-ui textarea{box-sizing:border-box;width:100%}
         .mission-router-ui .portals{max-height:180px;overflow:auto;margin:8px 0;padding:4px 6px;border:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .portals label{margin:3px 0}.mission-router-ui .mr-empty{margin:4px;opacity:.7}
         .mission-router-ui details{margin:8px 0}.mission-router-ui summary{cursor:pointer;font-weight:bold}
@@ -827,7 +953,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.1</small></h3>
+        <h3>Mission Route Planner <small>v0.12.0</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -837,8 +963,9 @@
         <section><h4>2. Configure route</h4>
           <label>Routing mode <select class="mode"><option value="straight">Straight-line estimate (offline)</option><option value="walk">Pedestrian paths</option></select></label>
           <div class="walking-settings" hidden>
-            <label>openrouteservice API key <input class="key" type="password" autocomplete="off"></label>
-            <p class="mr-help"><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. Selected coordinates are sent for routing; review any estimated segments.</p>
+            <p class="key-status">${bridge.hasKey ? 'API key saved securely by the userscript manager.' : 'No API key saved.'}</p>
+            <div class="mr-actions"><button class="set-key" type="button">Manage API key</button></div>
+            <p class="mr-help"><a href="https://account.heigit.org/" target="_blank" rel="noopener noreferrer">Get an API key</a>. The key stays outside the IITC page; enter a blank value to remove it.</p>
             <label><input class="visit-passing" type="checkbox" checked> Visit portals when within 30 m</label>
           </div>
           <label>Start portal <select class="start"><option value="">Automatic</option></select></label>
@@ -865,10 +992,17 @@
         try { await action(); } catch (e) { p.say(e.message); }
       }; };
       ui.querySelector('.cancel').onclick = () => p.controller?.abort();
-      ui.querySelector('.mode').onchange = () => {
+      ui.querySelector('.mode').onchange = async () => {
         ui.querySelector('.walking-settings').hidden = ui.querySelector('.mode').value !== 'walk';
+        if (ui.querySelector('.mode').value === 'walk') try { await p.refreshKeyState(); } catch (e) {
+          p.invalidate(); p.say(e.message); return;
+        }
         p.invalidate(); p.say('Routing mode changed. Optimize again.');
       };
+      on('.set-key', async () => {
+        const state = await p.bridge('configure-key'); p.showKeyState(state.hasKey);
+        p.say(state.changed ? (state.hasKey ? 'API key saved by the userscript manager.' : 'Saved API key removed.') : 'API key unchanged.');
+      });
       on('.scan', p.scan);
       on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.walkAccess = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
       ui.querySelector('.backtracking').onchange = () => { p.invalidate(); p.say('Backtracking preference changed. Optimize again.'); };
@@ -897,13 +1031,13 @@
         ui.querySelector('.cancel').disabled = false;
         p.say('Optimizing…');
         try {
-          const key = ui.querySelector('.key').value.trim(), walking = ui.querySelector('.mode').value === 'walk';
+          const walking = ui.querySelector('.mode').value === 'walk';
           const fixed = ui.querySelector('.start').value;
           const endGuid = ui.querySelector('.closed').checked ? '' : ui.querySelector('.end').value;
           if (endGuid && !points.some(v => v.guid === endGuid)) throw Error('The selected end portal is excluded.');
           if (fixed && endGuid === fixed) throw Error('Choose different start and end portals, or enable return-to-start.');
           if (fixed && !points.some(v => v.guid === fixed)) throw Error('The selected start portal is excluded.');
-          const rawMatrix = walking ? await p.walkMatrix(points, key, p.say) : points.map(a => points.map(b => p.distance(a, b)));
+          const rawMatrix = walking ? await p.walkMatrix(points, p.say) : points.map(a => points.map(b => p.distance(a, b)));
           // Pairwise disk-distance estimates guide ordering; the final path uses
           // consistent interaction positions, never these bounds as its total.
           const visitPassing = walking && ui.querySelector('.visit-passing').checked;
@@ -925,11 +1059,11 @@
             }
           }
           const walkingRoute = closed ? route.concat([route[0]]) : route;
-          let geometry = walking ? await p.walkGeometry(walkingRoute, key, p.say) : null;
+          let geometry = walking ? await p.walkGeometry(walkingRoute, p.say) : null;
           const backtracking = ui.querySelector('.backtracking').checked;
           let backtrackingInfo = '';
           if (backtracking) {
-            const refined = await p.reduceBacktracking(route, fixed, closed, matrix, points, geometry, key, p.say, endGuid);
+            const refined = await p.reduceBacktracking(route, fixed, closed, matrix, points, geometry, p.say, endGuid);
             route = refined.route; geometry = refined.geometry; backtrackingInfo = refined.info;
           }
           if (visitPassing) {
@@ -966,12 +1100,12 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.1'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.12.0'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
   }
   const script = document.createElement('script');
-  script.textContent = '(' + wrapper.toString() + ')();';
+  script.textContent = '(' + wrapper.toString() + ')(' + JSON.stringify({requestEvent, responseEvent, hasKey: keyState().hasKey}) + ');';
   (document.body || document.head || document.documentElement).appendChild(script); script.remove();
 })();
