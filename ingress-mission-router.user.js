@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.4
+// @version      0.11.5
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -144,6 +144,154 @@
     p.route = null;
     p.busy = false;
     p.walkCache = null;
+    p.walkDistanceCache = null;
+    p.walkPathCache = new Map();
+    p.walkingCacheConfig = Object.freeze({database: 'mission-route-planner', version: 1,
+      store: 'walking-cache', schema: 2, lifetime: 30 * 24 * 60 * 60 * 1000,
+      maxBytes: 8 * 1024 * 1024, maxEntries: 64});
+    p.walkingCacheDb = null;
+    p.cacheSignature = points => JSON.stringify(points.map(v => [v.guid, v.lng, v.lat]));
+    p.distanceCacheSignature = 'directed-walking-distances-v1';
+    p.portalFingerprint = portal => {
+      const identity = JSON.stringify([portal.guid, portal.lng, portal.lat]);
+      let first = 2166136261, second = 2654435769;
+      for (let i = 0; i < identity.length; i++) {
+        first = Math.imul(first ^ identity.charCodeAt(i), 16777619);
+        second = Math.imul(second ^ identity.charCodeAt(i), 2246822519);
+      }
+      return `${(first >>> 0).toString(36)}-${(second >>> 0).toString(36)}`;
+    };
+    p.cacheKey = (type, signature) => {
+      let hash = 2166136261;
+      for (let i = 0; i < signature.length; i++) {
+        hash ^= signature.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return `${type}:${(hash >>> 0).toString(36)}`;
+    };
+    p.cacheRecordSize = record => {
+      try { return JSON.stringify(record).length * 2; } catch (_) { return Infinity; }
+    };
+    p.validWalkingCacheRecord = (record, type, signature, now = Date.now()) => {
+      if (typeof type !== 'string' || typeof signature !== 'string') return false;
+      const key = p.cacheKey(type, signature);
+      return Boolean(record && record.key === key && record.type === type && record.signature === signature &&
+        record.schema === p.walkingCacheConfig.schema && Number.isFinite(record.createdAt) &&
+        Number.isFinite(record.updatedAt) && Number.isFinite(record.expiresAt) &&
+        record.createdAt <= record.updatedAt && record.updatedAt <= record.expiresAt &&
+        record.expiresAt > now && record.payload && typeof record.payload === 'object');
+    };
+    p.openWalkingCache = async () => {
+      if (!window.indexedDB) return null;
+      if (p.walkingCacheDb) return p.walkingCacheDb;
+      p.walkingCacheDb = new Promise(resolve => {
+        try {
+          const request = window.indexedDB.open(p.walkingCacheConfig.database, p.walkingCacheConfig.version);
+          request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(p.walkingCacheConfig.store))
+              db.createObjectStore(p.walkingCacheConfig.store, {keyPath: 'key'});
+          };
+          request.onsuccess = () => {
+            const db = request.result;
+            db.onversionchange = () => { db.close(); p.walkingCacheDb = null; };
+            resolve(db);
+          };
+          request.onerror = request.onblocked = () => resolve(null);
+        } catch (_) { resolve(null); }
+      });
+      return p.walkingCacheDb;
+    };
+    p.readWalkingCache = async (type, signature) => {
+      const db = await p.openWalkingCache();
+      if (!db) return null;
+      const key = p.cacheKey(type, signature);
+      const record = await new Promise(resolve => {
+        try {
+          const request = db.transaction(p.walkingCacheConfig.store).objectStore(p.walkingCacheConfig.store).get(key);
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = () => resolve(null);
+        } catch (_) { resolve(null); }
+      });
+      const valid = p.validWalkingCacheRecord(record, type, signature);
+      if (!valid) {
+        if (record) await p.deleteWalkingCache(type, signature);
+        return null;
+      }
+      return record.payload;
+    };
+    p.deleteWalkingCache = async (type, signature) => {
+      const db = await p.openWalkingCache();
+      if (!db) return;
+      await new Promise(resolve => {
+        try {
+          const tx = db.transaction(p.walkingCacheConfig.store, 'readwrite');
+          tx.objectStore(p.walkingCacheConfig.store).delete(p.cacheKey(type, signature));
+          tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+        } catch (_) { resolve(); }
+      });
+    };
+    p.pruneWalkingCache = async () => {
+      const db = await p.openWalkingCache();
+      if (!db) return;
+      const records = await new Promise(resolve => {
+        try {
+          const request = db.transaction(p.walkingCacheConfig.store).objectStore(p.walkingCacheConfig.store).getAll();
+          request.onsuccess = () => resolve(Array.isArray(request.result) ? request.result : []);
+          request.onerror = () => resolve([]);
+        } catch (_) { resolve([]); }
+      });
+      const now = Date.now(), remove = [], keep = records
+        .filter(record => {
+          const valid = p.validWalkingCacheRecord(record, record?.type, record?.signature, now);
+          if (!valid) remove.push(record?.key); return valid;
+        })
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      let bytes = 0, entries = 0;
+      for (const record of keep) {
+        const size = p.cacheRecordSize(record);
+        if (entries >= p.walkingCacheConfig.maxEntries || bytes + size > p.walkingCacheConfig.maxBytes)
+          remove.push(record.key);
+        else { entries++; bytes += size; }
+      }
+      if (!remove.length) return;
+      await new Promise(resolve => {
+        try {
+          const tx = db.transaction(p.walkingCacheConfig.store, 'readwrite'), store = tx.objectStore(p.walkingCacheConfig.store);
+          remove.filter(Boolean).forEach(key => store.delete(key));
+          tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+        } catch (_) { resolve(); }
+      });
+    };
+    p.writeWalkingCache = async (type, signature, payload) => {
+      const db = await p.openWalkingCache();
+      if (!db) return;
+      const now = Date.now(), record = {key: p.cacheKey(type, signature), type, signature,
+        schema: p.walkingCacheConfig.schema, createdAt: now, updatedAt: now,
+        expiresAt: now + p.walkingCacheConfig.lifetime, payload};
+      if (p.cacheRecordSize(record) > p.walkingCacheConfig.maxBytes) return;
+      await new Promise(resolve => {
+        try {
+          const tx = db.transaction(p.walkingCacheConfig.store, 'readwrite');
+          tx.objectStore(p.walkingCacheConfig.store).put(record);
+          tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+        } catch (_) { resolve(); }
+      });
+      await p.pruneWalkingCache();
+    };
+    p.clearWalkingCache = async () => {
+      p.walkCache = null; p.walkDistanceCache = null; p.matrixProgressCache = null;
+      p.walkAccess = null; p.walkPathCache.clear();
+      const db = await p.openWalkingCache();
+      if (!db) return;
+      await new Promise(resolve => {
+        try {
+          const tx = db.transaction(p.walkingCacheConfig.store, 'readwrite');
+          tx.objectStore(p.walkingCacheConfig.store).clear();
+          tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+        } catch (_) { resolve(); }
+      });
+    };
     const rad = Math.PI / 180;
     p.distance = (a, b) => {
       const x = Math.sin((a.lat - b.lat) * rad / 2);
@@ -252,39 +400,105 @@
         throw e;
       }
     };
+    p.emptyDistanceCache = () => ({identities: new Map(), access: new Map(), distances: new Map()});
+    p.restoreDistanceCache = payload => {
+      if (!payload || !Array.isArray(payload.identities) || !Array.isArray(payload.access) ||
+          !Array.isArray(payload.distances)) return null;
+      const cache = p.emptyDistanceCache();
+      for (const entry of payload.identities) {
+        if (!Array.isArray(entry) || typeof entry[0] !== 'string' || !Array.isArray(entry[1]) ||
+            entry[1].length !== 3 || typeof entry[1][0] !== 'string' ||
+            !Number.isFinite(entry[1][1]) || !Number.isFinite(entry[1][2])) return null;
+        const portal = {guid: entry[1][0], lng: entry[1][1], lat: entry[1][2]};
+        if (p.portalFingerprint(portal) !== entry[0] || cache.identities.has(entry[0])) return null;
+        cache.identities.set(entry[0], entry[1]);
+      }
+      for (const entry of payload.access) {
+        if (!Array.isArray(entry) || !cache.identities.has(entry[0]) || cache.access.has(entry[0])) return null;
+        const item = entry[1];
+        if (!item || typeof item.offPath !== 'boolean' ||
+            !(item.distance === null || Number.isFinite(item.distance) && item.distance >= 0) ||
+            (!item.offPath && (!Array.isArray(item.location) || item.location.length < 2 ||
+              !Number.isFinite(item.location[0]) || !Number.isFinite(item.location[1])))) return null;
+        cache.access.set(entry[0], item);
+      }
+      for (const entry of payload.distances) {
+        if (!Array.isArray(entry) || !cache.identities.has(entry[0]) || !Array.isArray(entry[1]) ||
+            cache.distances.has(entry[0])) return null;
+        const targets = new Map();
+        for (const pair of entry[1]) {
+          if (!Array.isArray(pair) || !cache.identities.has(pair[0]) ||
+              !Number.isFinite(pair[1]) || pair[1] < 0 || targets.has(pair[0])) return null;
+          targets.set(pair[0], pair[1]);
+        }
+        cache.distances.set(entry[0], targets);
+      }
+      return cache;
+    };
+    p.serializeDistanceCache = cache => ({identities: [...cache.identities], access: [...cache.access],
+      distances: [...cache.distances].map(([source, targets]) => [source, [...targets]])});
+    p.loadDistanceCache = async () => {
+      if (p.walkDistanceCache) return p.walkDistanceCache;
+      const payload = await p.readWalkingCache('distances', p.distanceCacheSignature);
+      const restored = p.restoreDistanceCache(payload);
+      p.walkDistanceCache = restored || p.emptyDistanceCache();
+      if (payload && !restored)
+        await p.deleteWalkingCache('distances', p.distanceCacheSignature);
+      return p.walkDistanceCache;
+    };
+    p.saveDistanceCache = async () => p.writeWalkingCache('distances', p.distanceCacheSignature,
+      p.serializeDistanceCache(p.walkDistanceCache));
     p.walkMatrix = async (points, progress) => {
-      if (!await p.refreshKeyState()) throw Error('Set an openrouteservice API key before using pedestrian routing.');
       if (points.length > 300) throw Error('Pedestrian mode currently supports up to 300 selected portals.');
-      const signature = JSON.stringify(points.map(v => [v.guid, v.lng, v.lat]));
+      const signature = p.cacheSignature(points);
       if (p.walkCache?.signature === signature) { p.walkAccess = p.walkCache.access; return p.walkCache.matrix; }
-      const n = points.length;
-      if (p.matrixProgressCache?.signature !== signature) p.matrixProgressCache = {
-        signature, matrix: points.map(a => Float64Array.from(points, b => p.distance(a, b))),
-        completed: new Set(), access: null
+      const cache = await p.loadDistanceCache(), fingerprints = points.map(p.portalFingerprint);
+      points.forEach((portal, i) => cache.identities.set(fingerprints[i], [portal.guid, portal.lng, portal.lat]));
+      let keyReady = false;
+      const requireKey = async () => {
+        if (!keyReady && !await p.refreshKeyState())
+          throw Error('Set an openrouteservice API key before using pedestrian routing.');
+        keyReady = true;
       };
-      const partial = p.matrixProgressCache, matrix = partial.matrix;
-      if (!partial.access) {
+      const missingAccess = points.map((portal, i) => ({portal, fingerprint: fingerprints[i]}))
+        .filter(item => !cache.access.has(item.fingerprint));
+      if (missingAccess.length) {
+        await requireKey();
         progress('Checking for mapped walking paths within 40m of portals…');
         const data = await p.request('snap/foot-walking/json', {
-          locations: points.map(v => [v.lng, v.lat]), radius: 40
+          locations: missingAccess.map(v => [v.portal.lng, v.portal.lat]), radius: 40
         });
-        if (!Array.isArray(data.locations) || data.locations.length !== n)
+        if (!Array.isArray(data.locations) || data.locations.length !== missingAccess.length)
           throw Error('Walking service returned incomplete path proximity information.');
-        const access = new Map();
-        points.forEach((portal, i) => {
+        missingAccess.forEach(({portal, fingerprint}, i) => {
           const snapped = data.locations[i];
-          if (snapped === null) { access.set(portal.guid, {offPath: true, distance: null}); return; }
+          if (snapped === null) { cache.access.set(fingerprint, {offPath: true, distance: null}); return; }
           const loc = snapped?.location;
           if (!Array.isArray(loc) || !Number.isFinite(loc[0]) || !Number.isFinite(loc[1]))
             throw Error('Walking service returned invalid path proximity information.');
           const distance = Number.isFinite(snapped.snapped_distance) && snapped.snapped_distance >= 0
             ? snapped.snapped_distance : p.distance(portal, {lng: loc[0], lat: loc[1]});
-          access.set(portal.guid, {location: loc, distance, offPath: distance >= 40});
+          cache.access.set(fingerprint, {location: loc, distance, offPath: distance >= 40});
         });
-        partial.access = access;
+        await p.saveDistanceCache();
       }
-      p.walkAccess = partial.access;
-      const onPath = points.map((portal, index) => ({portal, index})).filter(v => !p.walkAccess.get(v.portal.guid).offPath);
+      p.walkAccess = new Map(points.map((portal, i) => [portal.guid, cache.access.get(fingerprints[i])]));
+      const matrix = points.map(a => Float64Array.from(points, b => p.distance(a, b)));
+      const onPath = points.map((portal, index) => ({portal, index, fingerprint: fingerprints[index]}))
+        .filter(v => !p.walkAccess.get(v.portal.guid).offPath);
+      let complete = true;
+      for (const source of onPath) for (const destination of onPath) {
+        const value = cache.distances.get(source.fingerprint)?.get(destination.fingerprint);
+        if (value === undefined) complete = false; else matrix[source.index][destination.index] = value;
+      }
+      if (complete) {
+        p.walkCache = {signature, matrix, access: p.walkAccess};
+        progress('Reusing saved walking distances…'); return matrix;
+      }
+      await requireKey();
+      if (p.matrixProgressCache?.signature !== signature)
+        p.matrixProgressCache = {signature, completed: new Set()};
+      const partial = p.matrixProgressCache;
       const blocks = Math.ceil(onPath.length / 50); let completed = 0;
       // Only reachable portals go to the matrix service. All other pairs keep
       // their straight-line estimates instead of failing the complete matrix.
@@ -314,11 +528,15 @@
           if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
             throw Error(`No walking connection: ${sources[i].portal.title} → ${destinations[j].portal.title}. Exclude disconnected portals and retry.`);
           matrix[sources[i].index][destinations[j].index] = value;
+          if (!cache.distances.has(sources[i].fingerprint)) cache.distances.set(sources[i].fingerprint, new Map());
+          cache.distances.get(sources[i].fingerprint).set(destinations[j].fingerprint, value);
         }
         partial.completed.add(block);
       }
       p.checkCancel();
-      p.walkCache = {signature, matrix, access: partial.access}; p.matrixProgressCache = null; return matrix;
+      p.walkCache = {signature, matrix, access: p.walkAccess}; p.matrixProgressCache = null;
+      await p.saveDistanceCache();
+      return matrix;
     };
     p.pathPosition = portal => {
       const access = p.walkAccess?.get(portal.guid);
@@ -329,6 +547,22 @@
       duration: legs.reduce((sum, leg) => sum + leg.duration, 0),
       estimatedDistance: legs.reduce((sum, leg) => sum + (leg.estimated ? leg.distance : 0), 0),
       hasEstimates: legs.some(leg => leg.estimated), warnings: [...new Set(warnings)]});
+    p.pathCacheSignature = route => JSON.stringify(route.map(portal =>
+      [portal.guid, portal.lng, portal.lat, ...p.pathPosition(portal)]));
+    p.restorePathCache = (payload, route) => {
+      if (!payload || !Array.isArray(payload.legs) || payload.legs.length !== route.length - 1) return null;
+      const legs = payload.legs;
+      for (let i = 0; i < legs.length; i++) {
+        const leg = legs[i];
+        if (!leg || leg.estimated || !Number.isFinite(leg.distance) || leg.distance < 0 ||
+            !Number.isFinite(leg.duration) || leg.duration < 0 || !Array.isArray(leg.line) || leg.line.length < 2 ||
+            leg.line.some(ll => !Array.isArray(ll) || ll.length < 2 || !Number.isFinite(ll[0]) || !Number.isFinite(ll[1])) ||
+            p.distance(route[i], {lat: leg.line[0][0], lng: leg.line[0][1]}) > 40.001 ||
+            p.distance(route[i + 1], {lat: leg.line.at(-1)[0], lng: leg.line.at(-1)[1]}) > 40.001) return null;
+      }
+      return {legs, distance: legs.reduce((sum, leg) => sum + leg.distance, 0),
+        duration: legs.reduce((sum, leg) => sum + leg.duration, 0)};
+    };
     p.joinEstimatedLegs = (legs, closed = false) => {
       // End estimates at the actual mapped geometry, including any shift made
       // by interaction optimization. Never insert estimates into the path graph.
@@ -366,36 +600,49 @@
       return p.summarizeWalk(p.joinEstimatedLegs(legs, route[0].guid === route.at(-1).guid), warnings);
     };
     p.mappedWalkGeometry = async (route, progress) => {
-      const legs = [];
-      // Overlapping chunks preserve the link between missions and API batches.
-      for (let offset = 0; offset < route.length - 1; offset += 49) {
-        const chunk = route.slice(offset, offset + 50);
-        progress(`Fetching walking path ${offset + 1}–${offset + chunk.length}…`);
-        const data = await p.request('directions/foot-walking/geojson', {
-          coordinates: chunk.map(p.pathPosition), preference: 'recommended',
-          radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
-        });
-        const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
-        const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
-        if (feature?.geometry?.type !== 'LineString' || !Array.isArray(coordinates) ||
-            !Array.isArray(segments) || segments.length !== chunk.length - 1 ||
-            !Array.isArray(waypoints) || waypoints.length !== chunk.length)
-          throw Error('Walking service returned incomplete route geometry. Export blocked; retry.');
-        segments.forEach((segment, i) => {
-          const start = waypoints[i], end = waypoints[i + 1];
-          if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= coordinates.length ||
-              !Number.isFinite(segment.distance) || segment.distance < 0 || !Number.isFinite(segment.duration) || segment.duration < 0)
-            throw Error('Walking service returned an invalid route segment.');
-          const line = coordinates.slice(start, end + 1).map(c => {
-            if (!Number.isFinite(c[0]) || !Number.isFinite(c[1])) throw Error('Invalid walking coordinates.');
-            return [c[1], c[0]];
-          });
-          for (const [portal, ll] of [[chunk[i], line[0]], [chunk[i + 1], line[line.length - 1]]])
-            if (p.distance(portal, {lat: ll[0], lng: ll[1]}) > 40.001) throw Error(`Walking path ends too far from ${portal.title}.`);
-          legs.push({line, distance: segment.distance, duration: segment.duration});
-        });
+      const signature = p.pathCacheSignature(route);
+      let geometry = p.restorePathCache(p.walkPathCache.get(signature), route);
+      let savedPayload = null;
+      if (!geometry) {
+        savedPayload = await p.readWalkingCache('path', signature);
+        geometry = p.restorePathCache(savedPayload, route);
       }
-      const geometry = {legs, distance: legs.reduce((s, v) => s + v.distance, 0), duration: legs.reduce((s, v) => s + v.duration, 0)};
+      if (!geometry && savedPayload) await p.deleteWalkingCache('path', signature);
+      if (geometry) { p.walkPathCache.set(signature, geometry); progress('Reusing saved walking path…'); }
+      else {
+        const legs = [];
+        // Overlapping chunks preserve the link between missions and API batches.
+        for (let offset = 0; offset < route.length - 1; offset += 49) {
+          const chunk = route.slice(offset, offset + 50);
+          progress(`Fetching walking path ${offset + 1}–${offset + chunk.length}…`);
+          const data = await p.request('directions/foot-walking/geojson', {
+            coordinates: chunk.map(p.pathPosition), preference: 'recommended',
+            radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
+          });
+          const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
+          const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
+          if (feature?.geometry?.type !== 'LineString' || !Array.isArray(coordinates) ||
+              !Array.isArray(segments) || segments.length !== chunk.length - 1 ||
+              !Array.isArray(waypoints) || waypoints.length !== chunk.length)
+            throw Error('Walking service returned incomplete route geometry. Export blocked; retry.');
+          segments.forEach((segment, i) => {
+            const start = waypoints[i], end = waypoints[i + 1];
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= coordinates.length ||
+                !Number.isFinite(segment.distance) || segment.distance < 0 || !Number.isFinite(segment.duration) || segment.duration < 0)
+              throw Error('Walking service returned an invalid route segment.');
+            const line = coordinates.slice(start, end + 1).map(c => {
+              if (!Number.isFinite(c[0]) || !Number.isFinite(c[1])) throw Error('Invalid walking coordinates.');
+              return [c[1], c[0]];
+            });
+            for (const [portal, ll] of [[chunk[i], line[0]], [chunk[i + 1], line[line.length - 1]]])
+              if (p.distance(portal, {lat: ll[0], lng: ll[1]}) > 40.001) throw Error(`Walking path ends too far from ${portal.title}.`);
+            legs.push({line, distance: segment.distance, duration: segment.duration});
+          });
+        }
+        geometry = {legs, distance: legs.reduce((s, v) => s + v.distance, 0), duration: legs.reduce((s, v) => s + v.duration, 0)};
+        p.walkPathCache.set(signature, geometry);
+        await p.writeWalkingCache('path', signature, {legs});
+      }
       return p.useInteractionRange ? p.rangeWalk(geometry, route, progress) : geometry;
     };
     // Held–Karp gives the exact open-path ordering under the input matrix.
@@ -905,7 +1152,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.4', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.5', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -920,7 +1167,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.4</small></h3>
+        <h3>Mission Route Planner <small>v0.11.5</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -971,7 +1218,7 @@
         p.say(state.changed ? (state.hasKey ? 'API key set for this page session.' : 'API key removed.') : 'API key unchanged.');
       });
       on('.scan', p.scan);
-      on('.clear', () => { p.walkCache = null; p.matrixProgressCache = null; p.walkAccess = null; p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection cleared.'); });
+      on('.clear', async () => { await p.clearWalkingCache(); p.pool.clear(); p.excluded.clear(); p.invalidate(); p.renderPortals(); p.say('Collection and saved walking data cleared.'); });
       ui.querySelector('.backtracking').onchange = () => { p.invalidate(); p.say('Backtracking preference changed. Optimize again.'); };
       ui.querySelector('.visit-passing').onchange = () => { p.invalidate(); p.say('Visit-as-you-pass preference changed. Optimize again.'); };
       ui.querySelector('.closed').onchange = () => {
@@ -1067,7 +1314,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.4'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.5'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
