@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IITC plugin: Mission Route Planner
 // @namespace    opayc.ingress.mission-router
-// @version      0.11.6
+// @version      0.11.7
 // @description  Route loaded portals inside Draw Tools areas and export UMM 0.7.3 JSON.
 // @match        https://intel.ingress.com/*
 // @connect      api.heigit.org
@@ -145,13 +145,14 @@
     p.busy = false;
     p.walkCache = null;
     p.walkDistanceCache = null;
-    p.walkPathCache = new Map();
+    p.walkPathSegmentCache = null;
     p.walkingCacheConfig = Object.freeze({database: 'mission-route-planner', version: 1,
       store: 'walking-cache', schema: 2, lifetime: 30 * 24 * 60 * 60 * 1000,
       maxBytes: 8 * 1024 * 1024, maxEntries: 64});
     p.walkingCacheDb = null;
     p.cacheSignature = points => JSON.stringify(points.map(v => [v.guid, v.lng, v.lat]));
     p.distanceCacheSignature = 'directed-walking-distances-v1';
+    p.pathSegmentCacheSignature = 'directed-walking-path-segments-v1';
     p.portalFingerprint = portal => {
       const identity = JSON.stringify([portal.guid, portal.lng, portal.lat]);
       let first = 2166136261, second = 2654435769;
@@ -281,7 +282,7 @@
     };
     p.clearWalkingCache = async () => {
       p.walkCache = null; p.walkDistanceCache = null;
-      p.walkAccess = null; p.walkPathCache.clear();
+      p.walkAccess = null; p.walkPathSegmentCache = null;
       const db = await p.openWalkingCache();
       if (!db) return;
       await new Promise(resolve => {
@@ -579,21 +580,71 @@
       duration: legs.reduce((sum, leg) => sum + leg.duration, 0),
       estimatedDistance: legs.reduce((sum, leg) => sum + (leg.estimated ? leg.distance : 0), 0),
       hasEstimates: legs.some(leg => leg.estimated), warnings: [...new Set(warnings)]});
-    p.pathCacheSignature = route => JSON.stringify(route.map(portal =>
-      [portal.guid, portal.lng, portal.lat, ...p.pathPosition(portal)]));
-    p.restorePathCache = (payload, route) => {
-      if (!payload || !Array.isArray(payload.legs) || payload.legs.length !== route.length - 1) return null;
-      const legs = payload.legs;
-      for (let i = 0; i < legs.length; i++) {
-        const leg = legs[i];
-        if (!leg || leg.estimated || !Number.isFinite(leg.distance) || leg.distance < 0 ||
-            !Number.isFinite(leg.duration) || leg.duration < 0 || !Array.isArray(leg.line) || leg.line.length < 2 ||
-            leg.line.some(ll => !Array.isArray(ll) || ll.length < 2 || !Number.isFinite(ll[0]) || !Number.isFinite(ll[1])) ||
-            p.distance(route[i], {lat: leg.line[0][0], lng: leg.line[0][1]}) > 40.001 ||
-            p.distance(route[i + 1], {lat: leg.line.at(-1)[0], lng: leg.line.at(-1)[1]}) > 40.001) return null;
+    p.pathSegmentKey = (source, destination) => JSON.stringify([
+      p.portalFingerprint(source), ...p.pathPosition(source),
+      p.portalFingerprint(destination), ...p.pathPosition(destination)
+    ]);
+    p.pathSegmentEndpoints = key => {
+      try {
+        const values = JSON.parse(key);
+        if (!Array.isArray(values) || values.length !== 6 || typeof values[0] !== 'string' ||
+            typeof values[3] !== 'string' || values.slice(1, 3).concat(values.slice(4)).some(v => !Number.isFinite(v))) return null;
+        return {source: [values[1], values[2]], destination: [values[4], values[5]]};
+      } catch (_) { return null; }
+    };
+    p.validPathSegmentShape = (leg, endpoints) => Boolean(leg && !leg.estimated &&
+      Number.isFinite(leg.distance) && leg.distance >= 0 && Number.isFinite(leg.duration) && leg.duration >= 0 &&
+      Array.isArray(leg.line) && leg.line.length >= 2 &&
+      leg.line.every(ll => Array.isArray(ll) && ll.length >= 2 && Number.isFinite(ll[0]) && Number.isFinite(ll[1])) &&
+      (!endpoints || (p.distance({lng: endpoints.source[0], lat: endpoints.source[1]},
+        {lat: leg.line[0][0], lng: leg.line[0][1]}) <= 40.001 &&
+        p.distance({lng: endpoints.destination[0], lat: endpoints.destination[1]},
+          {lat: leg.line.at(-1)[0], lng: leg.line.at(-1)[1]}) <= 40.001)));
+    p.restorePathSegmentCache = payload => {
+      if (!payload || !Array.isArray(payload.segments)) return null;
+      const cache = new Map();
+      for (const entry of payload.segments) {
+        if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || cache.has(entry[0])) return null;
+        const endpoints = p.pathSegmentEndpoints(entry[0]);
+        if (!endpoints || !p.validPathSegmentShape(entry[1], endpoints)) return null;
+        cache.set(entry[0], entry[1]);
       }
-      return {legs, distance: legs.reduce((sum, leg) => sum + leg.distance, 0),
-        duration: legs.reduce((sum, leg) => sum + leg.duration, 0)};
+      return cache;
+    };
+    p.serializePathSegmentCache = cache => ({segments: [...cache]});
+    p.loadPathSegmentCache = async () => {
+      if (p.walkPathSegmentCache) return p.walkPathSegmentCache;
+      const payload = await p.readWalkingCache('path-segments', p.pathSegmentCacheSignature);
+      const restored = p.restorePathSegmentCache(payload);
+      p.walkPathSegmentCache = restored || new Map();
+      if (payload && !restored) await p.deleteWalkingCache('path-segments', p.pathSegmentCacheSignature);
+      return p.walkPathSegmentCache;
+    };
+    p.savePathSegmentCache = async () => p.writeWalkingCache('path-segments', p.pathSegmentCacheSignature,
+      p.serializePathSegmentCache(p.walkPathSegmentCache));
+    p.validPathSegment = (leg, source, destination) => {
+      if (!p.validPathSegmentShape(leg)) return false;
+      const sourcePosition = p.pathPosition(source), destinationPosition = p.pathPosition(destination);
+      const tolerance = portal => p.walkAccess?.get(portal.guid) && !p.walkAccess.get(portal.guid).offPath ? 1.001 : 40.001;
+      return p.distance({lng: sourcePosition[0], lat: sourcePosition[1]},
+        {lat: leg.line[0][0], lng: leg.line[0][1]}) <= tolerance(source) &&
+        p.distance({lng: destinationPosition[0], lat: destinationPosition[1]},
+          {lat: leg.line.at(-1)[0], lng: leg.line.at(-1)[1]}) <= tolerance(destination) &&
+        p.distance(source, {lat: leg.line[0][0], lng: leg.line[0][1]}) <= 40.001 &&
+        p.distance(destination, {lat: leg.line.at(-1)[0], lng: leg.line.at(-1)[1]}) <= 40.001;
+    };
+    p.pathSegmentsContinuous = (before, after) => p.distance(
+      {lat: before.line.at(-1)[0], lng: before.line.at(-1)[1]},
+      {lat: after.line[0][0], lng: after.line[0][1]}) <= 2.001;
+    p.composePathSegments = (route, legs) => {
+      if (!Array.isArray(legs) || legs.length !== route.length - 1) return null;
+      const composed = [];
+      for (let i = 0; i < legs.length; i++) {
+        if (!p.validPathSegment(legs[i], route[i], route[i + 1]) ||
+            i && !p.pathSegmentsContinuous(legs[i - 1], legs[i])) return null;
+        composed.push({...legs[i], line: legs[i].line.map(ll => [ll[0], ll[1]])});
+      }
+      return p.summarizeWalk(composed);
     };
     p.joinEstimatedLegs = (legs, closed = false) => {
       // End estimates at the actual mapped geometry, including any shift made
@@ -632,49 +683,69 @@
       return p.summarizeWalk(p.joinEstimatedLegs(legs, route[0].guid === route.at(-1).guid), warnings);
     };
     p.mappedWalkGeometry = async (route, progress) => {
-      const signature = p.pathCacheSignature(route);
-      let geometry = p.restorePathCache(p.walkPathCache.get(signature), route);
-      let savedPayload = null;
-      if (!geometry) {
-        savedPayload = await p.readWalkingCache('path', signature);
-        geometry = p.restorePathCache(savedPayload, route);
+      const cache = await p.loadPathSegmentCache();
+      const keys = route.slice(1).map((destination, i) => p.pathSegmentKey(route[i], destination));
+      const legs = new Array(keys.length).fill(null); let cacheChanged = false;
+      for (let i = 0; i < keys.length; i++) {
+        const leg = cache.get(keys[i]);
+        if (leg && p.validPathSegment(leg, route[i], route[i + 1])) legs[i] = leg;
+        else if (leg) { cache.delete(keys[i]); cacheChanged = true; }
       }
-      if (!geometry && savedPayload) await p.deleteWalkingCache('path', signature);
-      if (geometry) { p.walkPathCache.set(signature, geometry); progress('Reusing saved walking path…'); }
-      else {
-        const legs = [];
-        // Overlapping chunks preserve the link between missions and API batches.
-        for (let offset = 0; offset < route.length - 1; offset += 49) {
-          const chunk = route.slice(offset, offset + 50);
-          progress(`Fetching walking path ${offset + 1}–${offset + chunk.length}…`);
-          const data = await p.request('directions/foot-walking/geojson', {
-            coordinates: chunk.map(p.pathPosition), preference: 'recommended',
-            radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
-          });
-          const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
-          const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
-          if (feature?.geometry?.type !== 'LineString' || !Array.isArray(coordinates) ||
-              !Array.isArray(segments) || segments.length !== chunk.length - 1 ||
-              !Array.isArray(waypoints) || waypoints.length !== chunk.length)
-            throw Error('Walking service returned incomplete route geometry. Export blocked; retry.');
-          segments.forEach((segment, i) => {
-            const start = waypoints[i], end = waypoints[i + 1];
-            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= coordinates.length ||
-                !Number.isFinite(segment.distance) || segment.distance < 0 || !Number.isFinite(segment.duration) || segment.duration < 0)
-              throw Error('Walking service returned an invalid route segment.');
-            const line = coordinates.slice(start, end + 1).map(c => {
-              if (!Number.isFinite(c[0]) || !Number.isFinite(c[1])) throw Error('Invalid walking coordinates.');
-              return [c[1], c[0]];
-            });
-            for (const [portal, ll] of [[chunk[i], line[0]], [chunk[i + 1], line[line.length - 1]]])
-              if (p.distance(portal, {lat: ll[0], lng: ll[1]}) > 40.001) throw Error(`Walking path ends too far from ${portal.title}.`);
-            legs.push({line, distance: segment.distance, duration: segment.duration});
-          });
-        }
-        geometry = {legs, distance: legs.reduce((s, v) => s + v.distance, 0), duration: legs.reduce((s, v) => s + v.duration, 0)};
-        p.walkPathCache.set(signature, geometry);
-        await p.writeWalkingCache('path', signature, {legs});
+      // A shared portal must join adjacent cached legs. Re-fetch both sides of
+      // a discontinuity together so the service supplies one common waypoint.
+      for (let i = 1; i < legs.length; i++) if (legs[i - 1] && legs[i] && !p.pathSegmentsContinuous(legs[i - 1], legs[i])) {
+        cache.delete(keys[i - 1]); cache.delete(keys[i]);
+        legs[i - 1] = legs[i] = null; cacheChanged = true;
       }
+      if (cacheChanged) await p.savePathSegmentCache();
+      const runs = [];
+      for (let i = 0; i < legs.length;) {
+        if (legs[i]) { i++; continue; }
+        const start = i;
+        while (i < legs.length && !legs[i] && i - start < 49) i++;
+        runs.push({start, end: i});
+      }
+      const hits = legs.filter(Boolean).length;
+      if (!runs.length) progress(`Walking paths: ${hits}/${legs.length} segments cached; no requests needed.`);
+      else progress(`Walking paths: ${hits}/${legs.length} segments cached; ${legs.length - hits} missing in ${runs.length} request${runs.length === 1 ? '' : 's'}.`);
+      for (let requestIndex = 0; requestIndex < runs.length; requestIndex++) {
+        p.checkCancel();
+        const {start, end} = runs[requestIndex], chunk = route.slice(start, end + 1);
+        progress(`Fetching missing walking paths ${requestIndex + 1}/${runs.length} (segments ${start + 1}–${end})…`);
+        const data = await p.request('directions/foot-walking/geojson', {
+          coordinates: chunk.map(p.pathPosition), preference: 'recommended',
+          radiuses: chunk.map(() => p.walkAccess ? 1 : 40), instructions: true, units: 'm'
+        });
+        const feature = data.features?.[0], coordinates = feature?.geometry?.coordinates;
+        const segments = feature?.properties?.segments, waypoints = feature?.properties?.way_points;
+        if (feature?.geometry?.type !== 'LineString' || !Array.isArray(coordinates) ||
+            !Array.isArray(segments) || segments.length !== chunk.length - 1 ||
+            !Array.isArray(waypoints) || waypoints.length !== chunk.length)
+          throw Error('Walking service returned incomplete route geometry. Export blocked; retry.');
+        const updates = segments.map((segment, i) => {
+          const first = waypoints[i], last = waypoints[i + 1];
+          if (!Number.isInteger(first) || !Number.isInteger(last) || first < 0 || last < first || last >= coordinates.length ||
+              !Number.isFinite(segment.distance) || segment.distance < 0 || !Number.isFinite(segment.duration) || segment.duration < 0)
+            throw Error('Walking service returned an invalid route segment.');
+          const line = coordinates.slice(first, last + 1).map(c => {
+            if (!Array.isArray(c) || !Number.isFinite(c[0]) || !Number.isFinite(c[1])) throw Error('Invalid walking coordinates.');
+            return [c[1], c[0]];
+          });
+          if (line.length === 1) line.push([...line[0]]);
+          const leg = {line, distance: segment.distance, duration: segment.duration};
+          if (!p.validPathSegment(leg, chunk[i], chunk[i + 1]))
+            throw Error(`Walking path does not connect the checked paths near ${chunk[i].title} and ${chunk[i + 1].title}.`);
+          return leg;
+        });
+        if (updates.some((leg, i) => i && !p.pathSegmentsContinuous(updates[i - 1], leg)))
+          throw Error('Walking service returned discontinuous route geometry. Export blocked; retry.');
+        // Publish only after validating the complete response, then persist it
+        // before the next request so completed legs survive failure or cancel.
+        updates.forEach((leg, i) => { legs[start + i] = leg; cache.set(keys[start + i], leg); });
+        await p.savePathSegmentCache();
+      }
+      const geometry = p.composePathSegments(route, legs);
+      if (!geometry) throw Error('Walking path segments could not be joined continuously. Export blocked; retry.');
       return p.useInteractionRange ? p.rangeWalk(geometry, route, progress) : geometry;
     };
     // Held–Karp gives the exact open-path ordering under the input matrix.
@@ -1184,7 +1255,7 @@
     p.open = () => {
       if (p.ui) {
         p.refreshKeyState().catch(e => p.say(e.message));
-        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.6', html: p.ui, width: 440}); return;
+        window.dialog({id: 'mission-router', title: 'Mission Route Planner v0.11.7', html: p.ui, width: 440}); return;
       }
       const ui = p.ui = document.createElement('div');
       ui.className = 'mission-router-ui';
@@ -1199,7 +1270,7 @@
         .mission-router-ui .mr-actions{display:flex;gap:6px;flex-wrap:wrap}.mission-router-ui .status{margin:10px 0 0;padding-top:8px;border-top:1px solid rgba(128,128,128,.45)}
         .mission-router-ui .banner-hint,.mission-router-ui .end-hint{margin:5px 0 8px}
       </style>
-        <h3>Mission Route Planner <small>v0.11.6</small></h3>
+        <h3>Mission Route Planner <small>v0.11.7</small></h3>
         <p class="mr-help">Build a mission route from portals loaded inside your Draw Tools areas.</p>
         <section><h4>1. Collect portals</h4>
           <p class="mr-help">Draw one or more areas. If portals are missing, pan to load them and scan again.</p>
@@ -1346,7 +1417,7 @@
       link.onclick = e => { e.preventDefault(); p.open(); };
       document.getElementById('toolbox').append(link);
     }
-    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.6'}};
+    setup.info = {pluginId: 'mission-router', script: {name: 'Mission Route Planner', version: '0.11.7'}};
     if (!window.bootPlugins) window.bootPlugins = [];
     window.bootPlugins.push(setup);
     if (window.iitcLoaded) setup();
